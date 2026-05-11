@@ -17,13 +17,13 @@ import * as XLSX from 'xlsx';
 // 🔴 老師請注意：請在此填入您的 Firebase 設定 🔴
 // ==========================================
 const userFirebaseConfig = {
-  apiKey: "AIzaSyDuZZfVoOmN0GdNKESoq1sMc0VkwQCFtgQ",
-  authDomain: "student-record-e9c61.firebaseapp.com",
-  projectId: "student-record-e9c61",
-  storageBucket: "student-record-e9c61.firebasestorage.app",
-  messagingSenderId: "392062995542",
-  appId: "1:392062995542:web:254bda3e1cafcca3883ff7",
-  measurementId: "G-7NM3JQESLJ"
+  apiKey: "AIzaSyAAu801RjoYkki3JEOw1WPQDGBHxLqAy3U",
+  authDomain: "student-record-10391.firebaseapp.com",
+  projectId: "student-record-10391",
+  storageBucket: "student-record-10391.firebasestorage.app",
+  messagingSenderId: "93081425564",
+  appId: "1:93081425564:web:10ca88c855b46ef800bf59",
+  measurementId: "G-YGE2HJHNQ9"
 };
 
 // 系統防呆與環境識別
