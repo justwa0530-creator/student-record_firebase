@@ -4,12 +4,13 @@ import {
   getAuth, signInWithCustomToken, signInAnonymously, 
   onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut 
 } from 'firebase/auth';
-import { getFirestore, doc, setDoc, onSnapshot } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, onSnapshot, getDoc, serverTimestamp } from 'firebase/firestore';
 import { 
   Users, Plus, UploadCloud, FileSpreadsheet, Info, CheckCircle2,
   ArrowLeft, X, Cloud, ChevronRight, AlertTriangle, Loader2, Save,
   ThumbsUp, ThumbsDown, Trash2, LayoutGrid, Table as TableIcon, 
-  FileDown, CheckSquare, Search, CloudOff, User, LogOut, UserCog
+  FileDown, CheckSquare, Search, CloudOff, User, LogOut, UserCog,
+  Database, RefreshCw, Send
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 
@@ -65,10 +66,20 @@ export default function App() {
   const [selectedClass, setSelectedClass] = useState(null);
   const [notification, setNotification] = useState(null);
   const [isCloudModalOpen, setIsCloudModalOpen] = useState(false);
+  const [apiUrl, setApiUrl] = useState('');
   const [syncStatus, setSyncStatus] = useState('idle');
 
-  // 初始化 Firebase 驗證
+  // 初始化 Firebase 驗證與讀取本地設定
   useEffect(() => {
+    const localData = localStorage.getItem('school_moral_data');
+    if (localData) {
+      try {
+        setAppData(repairData(JSON.parse(localData)));
+      } catch (e) { console.error('本地資料解析失敗', e); }
+    }
+    const savedUrl = localStorage.getItem('gas_api_url');
+    if (savedUrl) setApiUrl(savedUrl);
+
     const initAuth = async () => {
       try {
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
@@ -81,36 +92,65 @@ export default function App() {
       }
     };
     initAuth();
-    const unsubscribe = onAuthStateChanged(auth, (u) => {
+
+    const unsubscribe = onAuthStateChanged(auth, async (u) => {
       setUser(u);
       setAuthLoading(false);
+      
+      // --- 終極強化：匿名轉移與強制拉取機制 ---
+      if (u && !u.isAnonymous) {
+        try {
+          const docRef = doc(db, 'artifacts', appId, 'users', u.uid, 'schoolData', 'main');
+          const snap = await getDoc(docRef);
+          
+          if (snap.exists()) {
+            // 情境 1：雲端有資料 -> 覆蓋本地 (換手機登入時發生)
+            const cloudData = snap.data();
+            const repaired = repairData(cloudData.data);
+            repaired.updatedAtLocal = cloudData.updatedAtLocal || Date.now();
+            setAppData(repaired);
+            localStorage.setItem('school_moral_data', JSON.stringify(repaired));
+          } else {
+            // 情境 2：雲端沒資料 -> 把本地(訪客模式打的)資料推上去綁定！(防清空)
+            const local = JSON.parse(localStorage.getItem('school_moral_data') || '{}');
+            if (local.classes && local.classes.length > 0) {
+              const localTime = Date.now();
+              await setDoc(docRef, {
+                data: local,
+                updatedAt: serverTimestamp(),
+                updatedAtLocal: localTime
+              });
+            }
+          }
+        } catch (err) {
+          console.error("處理雲端資料轉移失敗", err);
+        }
+      }
     });
     return () => unsubscribe();
   }, []);
 
-  // 監聽 Firebase 資料庫變化
+  // 監聽 Firebase 資料庫變化 (防 Snapshot 競爭)
   useEffect(() => {
-    if (!user) return;
+    if (!user || user.isAnonymous) return;
     const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'schoolData', 'main');
     
-    setSyncStatus('syncing');
     const unsubscribe = onSnapshot(docRef, (docSnap) => {
       if (docSnap.exists()) {
-        const cloudData = repairData(docSnap.data().data);
-        setAppData(cloudData);
-        localStorage.setItem('school_moral_data', JSON.stringify(cloudData));
-        setSyncStatus('success');
-      } else {
-        // 如果雲端沒有資料，嘗試從手機本地讀取並上傳
-        const local = localStorage.getItem('school_moral_data');
-        if (local) {
-          const parsed = JSON.parse(local);
-          setAppData(repairData(parsed));
-          setDoc(docRef, { data: parsed }).catch(console.error);
+        const cloudDoc = docSnap.data();
+        const localDoc = JSON.parse(localStorage.getItem('school_moral_data') || '{}');
+        
+        // --- 核心修正：時間戳比對 (防 Race Condition) ---
+        // 只有當「雲端的時間戳 > 本地時間戳」或「本地無時間戳」時，才允許覆蓋畫面
+        if (!localDoc.updatedAtLocal || (cloudDoc.updatedAtLocal && cloudDoc.updatedAtLocal > localDoc.updatedAtLocal)) {
+          const repaired = repairData(cloudDoc.data);
+          repaired.updatedAtLocal = cloudDoc.updatedAtLocal;
+          setAppData(repaired);
+          localStorage.setItem('school_moral_data', JSON.stringify(repaired));
+          setSyncStatus('success');
+          setTimeout(() => setSyncStatus('idle'), 3000);
         }
-        setSyncStatus('idle');
       }
-      setTimeout(() => setSyncStatus('idle'), 2000);
     }, (error) => {
       console.error(error);
       setSyncStatus('error');
@@ -119,24 +159,88 @@ export default function App() {
     return () => unsubscribe();
   }, [user]);
 
-  // 儲存資料 (自動推送到 Firebase)
+  // 儲存資料 (自動推送到 Firebase 與 GAS)
   const saveAppData = async (newData) => {
-    const repairedData = repairData(newData);
-    setAppData(repairedData); // 樂觀更新 UI
-    localStorage.setItem('school_moral_data', JSON.stringify(repairedData)); // 本地備份
+    const localTime = Date.now();
+    const dataToSave = { ...repairData(newData), updatedAtLocal: localTime };
     
-    if (user) {
-      setSyncStatus('syncing');
+    // 1. 樂觀更新 UI 與本地
+    setAppData(dataToSave); 
+    localStorage.setItem('school_moral_data', JSON.stringify(dataToSave)); 
+    
+    let hasError = false;
+    setSyncStatus('syncing');
+
+    // 2. [同步 A]：Firebase (帶入 serverTimestamp)
+    if (user && !user.isAnonymous) {
       try {
         const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'schoolData', 'main');
-        await setDoc(docRef, { data: repairedData });
-        setSyncStatus('success');
-        setTimeout(() => setSyncStatus('idle'), 2000);
+        await setDoc(docRef, { 
+          data: dataToSave, 
+          updatedAt: serverTimestamp(), // 給資料庫排序用
+          updatedAtLocal: localTime     // 給客戶端防重複覆蓋用
+        });
       } catch (err) {
         console.error("寫入雲端失敗", err);
-        setSyncStatus('error');
+        hasError = true;
       }
     }
+
+    // 3. [同步 B]：Google Apps Script
+    if (apiUrl) {
+      try {
+        const res = await fetch(apiUrl, {
+          method: 'POST',
+          body: JSON.stringify({ data: dataToSave }),
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        });
+        if (!res.ok) throw new Error('GAS Sync failed');
+      } catch (err) {
+        console.error("GAS 寫入失敗", err);
+        hasError = true;
+      }
+    }
+
+    if (hasError) {
+      setSyncStatus('error');
+    } else if ((user && !user.isAnonymous) || apiUrl) {
+      setSyncStatus('success');
+      setTimeout(() => setSyncStatus('idle'), 2000);
+    } else {
+      setSyncStatus('idle'); 
+    }
+  };
+
+  // 手動從 GAS 抓取資料
+  const fetchFromGasCloud = async (url) => {
+    setSyncStatus('syncing');
+    try {
+      const res = await fetch(url, { redirect: 'follow' });
+      if (!res.ok) throw new Error('Network response was not ok');
+      const cloudData = await res.json();
+      if (cloudData && cloudData.classes) {
+        const repaired = repairData(cloudData);
+        repaired.updatedAtLocal = Date.now();
+        setAppData(repaired);
+        localStorage.setItem('school_moral_data', JSON.stringify(repaired));
+        setSyncStatus('success');
+        showNotification('成功從 Google Sheet 下載最新資料！');
+        
+        if (user && !user.isAnonymous) {
+           const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'schoolData', 'main');
+           await setDoc(docRef, { 
+             data: repaired, 
+             updatedAt: serverTimestamp(),
+             updatedAtLocal: repaired.updatedAtLocal 
+           });
+        }
+      }
+    } catch (err) {
+      console.error('下載錯誤詳情：', err);
+      setSyncStatus('error');
+      showNotification('Google Sheet 下載失敗，請檢查網址設定。');
+    }
+    setTimeout(() => setSyncStatus('idle'), 3000);
   };
 
   const handleAddClass = (classData, students) => {
@@ -221,9 +325,16 @@ export default function App() {
       )}
 
       {isCloudModalOpen && (
-        <CloudAuthModal 
+        <DualCloudSettingsModal 
           user={user}
+          apiUrl={apiUrl}
+          setApiUrl={(url) => { setApiUrl(url); localStorage.setItem('gas_api_url', url); }}
           onClose={() => setIsCloudModalOpen(false)}
+          onFetchFromGas={() => fetchFromGasCloud(apiUrl)}
+          onForcePush={() => {
+            saveAppData(appData);
+            showNotification("已觸發強制同步上傳！");
+          }}
         />
       )}
 
@@ -261,23 +372,26 @@ export default function App() {
 }
 
 // ==========================================
-// Firebase 專用身分驗證面板
+// 雙重雲端同步設定面板 (Firebase + GAS)
 // ==========================================
-function CloudAuthModal({ user, onClose }) {
+function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromGas, onForcePush }) {
   const [loading, setLoading] = useState(false);
-  const [errorMsg, setErrorMsg] = useState('');
+  const [tempUrl, setTempUrl] = useState(apiUrl);
 
   const handleGoogleLogin = async () => {
     setLoading(true);
-    setErrorMsg('');
     const provider = new GoogleAuthProvider();
     provider.setCustomParameters({ prompt: 'select_account' }); 
     try {
-      await signInWithPopup(auth, provider);
-      onClose();
+      // 這裡直接改成 signInWithRedirect
+      await signInWithRedirect(auth, provider);
     } catch (error) {
-      if (error.code !== 'auth/popup-closed-by-user') {
-        setErrorMsg("登入失敗：" + error.message);
+      if (error.code === 'auth/unauthorized-domain') {
+        alert("⚠️ 網域未授權錯誤！\n\n請到 Firebase 後台 -> Authentication -> Settings -> Authorized domains 中新增目前網址！");
+      } else if (error.code === 'auth/admin-restricted-operation' || error.message.includes('restricted')) {
+        alert("登入失敗：您的學校帳號 (@go.edu.tw) 可能阻擋了登入，請改用一般 Gmail 帳號測試。");
+      } else if (error.code !== 'auth/popup-closed-by-user') {
+        alert("登入發生錯誤：" + error.message);
       }
     }
     setLoading(false);
@@ -285,69 +399,118 @@ function CloudAuthModal({ user, onClose }) {
 
   const handleLogout = async () => {
     setLoading(true);
-    await signOut(auth);
-    await signInAnonymously(auth);
-    onClose();
+    try {
+      await signOut(auth);
+      try {
+        await signInAnonymously(auth);
+      } catch (e) {
+        console.warn("匿名登入失敗或未啟用", e);
+      }
+    } catch (error) {
+      alert("登出發生錯誤：" + error.message);
+    }
     setLoading(false);
+  };
+
+  const handleSaveGas = () => {
+    setApiUrl(tempUrl);
+    alert("Google Sheet 網址已儲存！");
   };
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex flex-col justify-end sm:justify-center items-center z-50 sm:p-4">
-      <div className="bg-white rounded-t-3xl sm:rounded-3xl shadow-2xl w-full max-w-md overflow-hidden animate-in slide-in-from-bottom-full sm:slide-in-from-bottom-0 sm:zoom-in-95 duration-200">
-        <div className="bg-indigo-600 px-6 py-5 flex justify-between items-center text-white">
-          <h2 className="text-lg font-bold flex items-center gap-2"><Cloud className="w-6 h-6" /> 雲端備份與帳號</h2>
+      <div className="bg-white rounded-t-3xl sm:rounded-3xl shadow-2xl w-full max-w-md overflow-hidden animate-in slide-in-from-bottom-full sm:slide-in-from-bottom-0 sm:zoom-in-95 duration-200 flex flex-col max-h-[90vh]">
+        <div className="bg-indigo-600 px-6 py-5 flex justify-between items-center text-white flex-shrink-0">
+          <h2 className="text-lg font-bold flex items-center gap-2"><Cloud className="w-6 h-6" /> 同步與備份設定</h2>
           <button onClick={onClose} className="p-1 text-indigo-200 hover:text-white rounded-full active:scale-95"><X className="w-6 h-6" /></button>
         </div>
 
-        <div className="p-6 pb-8 space-y-6">
-          <div className="bg-blue-50 border border-blue-100 text-blue-800 p-4 rounded-2xl text-sm font-medium leading-relaxed">
-            系統支援**離線使用**，紀錄會優先保存在手機中。登入 Google 帳號後，您的班級資料會自動綁定並備份到 Firebase 雲端，跨裝置也能無縫接軌！
+        <div className="p-6 overflow-y-auto space-y-6">
+          {/* Firebase 區塊 */}
+          <div className="bg-white p-5 rounded-2xl shadow-sm border border-gray-100">
+            <div className="flex items-center gap-2 mb-4">
+              <Database className="w-5 h-5 text-indigo-500" />
+              <h3 className="font-black text-gray-900">方案 A：Google 帳號綁定</h3>
+            </div>
+            <div className="bg-red-50 text-red-700 p-3 rounded-xl text-xs font-bold mb-4 border border-red-100">
+              ⚠️ 建議使用「一般 Gmail」。登入後將固定 UID，跨裝置同步不再錯亂。
+            </div>
+            
+            <div className="bg-gray-50 rounded-xl p-4 flex items-center justify-between mb-4">
+               <div className="flex items-center gap-3 overflow-hidden">
+                 <div className="w-10 h-10 bg-indigo-100 rounded-full flex items-center justify-center flex-shrink-0 overflow-hidden">
+                    {user?.photoURL && !user?.isAnonymous ? (
+                      <img src={user.photoURL} alt="avatar" className="w-full h-full object-cover" />
+                    ) : (
+                      <User className={`w-5 h-5 ${user?.isAnonymous ? 'text-gray-400' : 'text-indigo-600'}`} />
+                    )}
+                 </div>
+                 <div className="overflow-hidden">
+                   <div className="font-black text-sm text-gray-900 truncate">
+                     {user?.isAnonymous ? '目前為訪客模式' : (user?.displayName || '已登入')}
+                   </div>
+                   <div className="text-xs text-gray-500 font-bold truncate w-48 sm:w-56">
+                     {user?.isAnonymous ? '資料僅存本機，切換帳號會自動轉移' : user?.email}
+                   </div>
+                 </div>
+               </div>
+            </div>
+
+            {!user?.isAnonymous && (
+              <button 
+                onClick={() => { onForcePush(); onClose(); }}
+                className="w-full py-3 mb-4 rounded-xl font-black text-white bg-green-600 shadow-md active:scale-95 transition flex items-center justify-center gap-2"
+              >
+                <Send className="w-5 h-5"/> 立即強制同步上傳
+              </button>
+            )}
+
+            {user?.isAnonymous ? (
+              <button onClick={handleGoogleLogin} disabled={loading} className="w-full py-3 rounded-xl font-black text-white bg-indigo-600 shadow-md active:scale-95 transition flex items-center justify-center gap-2">
+                {loading ? <Loader2 className="animate-spin w-5 h-5"/> : <Cloud className="w-5 h-5"/>} 登入個人 Google 帳號
+              </button>
+            ) : (
+              <div className="flex gap-2">
+                <button onClick={handleLogout} disabled={loading} className="flex-1 py-3 rounded-xl font-black text-red-600 bg-red-50 active:scale-95 transition flex items-center justify-center gap-2">
+                  {loading ? <Loader2 className="animate-spin w-5 h-5"/> : <LogOut className="w-5 h-5"/>} 登出
+                </button>
+                <button onClick={handleGoogleLogin} disabled={loading} className="flex-1 py-3 rounded-xl font-black text-indigo-600 bg-indigo-50 active:scale-95 transition flex items-center justify-center gap-2">
+                  {loading ? <Loader2 className="animate-spin w-5 h-5"/> : <RefreshCw className="w-5 h-5"/>} 切換帳號
+                </button>
+              </div>
+            )}
           </div>
 
-          {errorMsg && (
-            <div className="bg-red-50 text-red-600 border border-red-200 p-3 rounded-xl text-sm font-bold">
-              {errorMsg}
+          {/* GAS 區塊 */}
+          <div className="bg-white p-5 rounded-2xl shadow-sm border border-gray-100">
+            <div className="flex items-center gap-2 mb-4">
+              <FileSpreadsheet className="w-5 h-5 text-green-500" />
+              <h3 className="font-black text-gray-900">方案 B：Google Sheet 備份</h3>
             </div>
-          )}
-
-          <div className="text-center py-4">
-            <div className="inline-flex items-center justify-center w-16 h-16 bg-gray-100 rounded-full mb-3">
-              <User className={`w-8 h-8 ${user?.isAnonymous ? 'text-gray-400' : 'text-indigo-600'}`} />
+            <p className="text-xs text-gray-500 font-bold mb-4">將資料寫入指定的 Google 試算表中保存。可與方案 A 同時啟用作為雙重備份。</p>
+            
+            <div className="space-y-3">
+              <input 
+                type="text" value={tempUrl} onChange={(e) => setTempUrl(e.target.value)}
+                placeholder="貼上 Apps Script 部署網址 (https://script.google.com/...)"
+                className="w-full p-3 bg-gray-50 border border-gray-200 rounded-xl outline-none focus:border-green-500 focus:ring-1 focus:ring-green-500 text-sm font-medium"
+              />
+              <div className="flex gap-2">
+                <button onClick={handleSaveGas} className="flex-1 py-3 bg-green-50 text-green-700 rounded-xl font-black active:scale-95 transition">儲存網址</button>
+                <button onClick={onFetchFromGas} disabled={!apiUrl} className="flex-1 py-3 bg-green-600 text-white rounded-xl font-black active:scale-95 transition disabled:opacity-50 flex items-center justify-center gap-1">
+                  <RefreshCw className="w-4 h-4" /> 從 Sheet 載入
+                </button>
+              </div>
             </div>
-            <h3 className="font-black text-lg text-gray-900">
-              {user?.isAnonymous ? '目前為訪客模式' : '已登入雲端'}
-            </h3>
-            <p className="text-sm text-gray-500 font-bold mt-1 truncate">
-              {user?.isAnonymous ? '資料僅保存在此設備的瀏覽器中' : user?.email}
-            </p>
           </div>
 
-          {user?.isAnonymous ? (
-            <button 
-              onClick={handleGoogleLogin} disabled={loading}
-              className="w-full py-4 rounded-2xl font-black text-white bg-indigo-600 shadow-xl shadow-indigo-200 active:scale-95 transition flex items-center justify-center gap-2"
-            >
-              {loading ? <Loader2 className="animate-spin w-5 h-5"/> : <Cloud className="w-5 h-5"/>} 
-              使用 Google 帳號登入
-            </button>
-          ) : (
-            <button 
-              onClick={handleLogout} disabled={loading}
-              className="w-full py-4 rounded-2xl font-black text-red-600 bg-red-50 active:scale-95 transition flex items-center justify-center gap-2"
-            >
-              {loading ? <Loader2 className="animate-spin w-5 h-5"/> : <LogOut className="w-5 h-5"/>} 
-              登出並返回訪客模式
-            </button>
-          )}
         </div>
       </div>
     </div>
   );
 }
 
-// ==========================================
-// 儀表板 (新增防呆刪除模態框)
-// ==========================================
+// 以下保留所有原有的 UI 組件 (Dashboard, AddClass, ClassManagement 等)
 function Dashboard({ classes, students, onAddClick, onEnterClass, onDeleteClass }) {
   const [classToDelete, setClassToDelete] = useState(null);
   const [deleteConfirmText, setDeleteConfirmText] = useState('');
@@ -414,7 +577,6 @@ function Dashboard({ classes, students, onAddClick, onEnterClass, onDeleteClass 
         </div>
       )}
 
-      {/* 刪除班級防呆驗證模態框 */}
       {classToDelete && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-3xl p-6 max-w-sm w-full animate-in zoom-in-95 duration-200 shadow-2xl">
@@ -516,7 +678,6 @@ function AddClassView({ onBack, onSave, onNotify }) {
           
           if (!json.length) throw new Error("檔案為空");
 
-          // --- 智慧掃描邏輯 ---
           let headerRowIndex = -1;
           let sIdx = -1;
           let nIdx = -1;
@@ -741,7 +902,7 @@ function ClassManagementView({ classData, students, records, onBack, onAddRecord
 }
 
 // ==========================================
-// 編輯學生名單專用模態框 (增刪轉學生)
+// 編輯學生名單專用模態框
 // ==========================================
 function EditStudentsModal({ classId, students, onClose, onSave }) {
   const [localStudents, setLocalStudents] = useState([...students]);
@@ -762,7 +923,6 @@ function EditStudentsModal({ classId, students, onClose, onSave }) {
   };
 
   const handleRemove = (id) => {
-    // 編輯模式下直接在本地陣列移除，點擊儲存後才會真正生效
     setLocalStudents(localStudents.filter(s => s.id !== id));
   };
 
@@ -778,7 +938,6 @@ function EditStudentsModal({ classId, students, onClose, onSave }) {
         </div>
         
         <div className="p-6 overflow-y-auto space-y-6">
-          {/* 新增轉學生區塊 */}
           <div className="bg-indigo-50 p-4 rounded-2xl border border-indigo-100">
             <h4 className="text-xs font-bold text-indigo-800 mb-3 flex items-center gap-1">
               <Plus className="w-4 h-4" /> 加入轉入生
@@ -798,7 +957,6 @@ function EditStudentsModal({ classId, students, onClose, onSave }) {
             </div>
           </div>
 
-          {/* 現有學生列表區塊 */}
           <div className="space-y-2">
             <div className="flex justify-between items-center mb-1">
               <h4 className="text-sm font-bold text-gray-500">班級目前名單</h4>
@@ -875,6 +1033,18 @@ function RecordModal({ selectedStudents, classId, onClose, onSave }) {
               <button onClick={() => setPoints(points+1)} className="w-10 h-10 rounded-full bg-white shadow-sm font-black active:scale-95">+</button>
             </div>
           </div>
+
+          <div className="mb-2">
+            <label className="block text-sm font-bold text-gray-700 mb-2">備註事項 (選填)</label>
+            <input 
+              type="text" 
+              value={note} 
+              onChange={(e) => setNote(e.target.value)}
+              placeholder="輸入相關備註..." 
+              className="w-full p-3 bg-gray-50 border border-gray-200 rounded-xl outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 text-sm font-medium"
+            />
+          </div>
+
           <button onClick={handleSave} disabled={!selectedItem} className={`w-full py-4 rounded-2xl font-black text-white text-lg shadow-xl transition active:scale-95 ${!selectedItem ? 'bg-gray-300' : (type === 'positive' ? 'bg-green-600' : 'bg-red-500')}`}>確認給分</button>
         </div>
       </div>
