@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, signInWithCustomToken, signInAnonymously, 
-  onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut 
+  onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signInWithRedirect, signOut 
 } from 'firebase/auth';
 import { getFirestore, doc, setDoc, onSnapshot, getDoc, serverTimestamp } from 'firebase/firestore';
 import { 
