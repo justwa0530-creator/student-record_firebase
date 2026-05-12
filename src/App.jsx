@@ -18,12 +18,13 @@ import * as XLSX from 'xlsx';
 // 🔴 老師請注意：請在此填入您的 Firebase 設定 🔴
 // ==========================================
 const userFirebaseConfig = {
-  apiKey: "YOUR_API_KEY",
-  authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
-  projectId: "YOUR_PROJECT_ID",
-  storageBucket: "YOUR_PROJECT_ID.appspot.com",
-  messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
-  appId: "YOUR_APP_ID"
+  apiKey: "AIzaSyAAu801RjoYkki3JEOw1WPQDGBHxLqAy3U",
+  authDomain: "student-record-10391.firebaseapp.com",
+  projectId: "student-record-10391",
+  storageBucket: "student-record-10391.firebasestorage.app",
+  messagingSenderId: "93081425564",
+  appId: "1:93081425564:web:10ca88c855b46ef800bf59",
+  measurementId: "G-YGE2HJHNQ9"
 };
 
 // 系統防呆與環境識別
