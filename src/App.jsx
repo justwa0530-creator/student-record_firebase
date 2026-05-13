@@ -457,9 +457,8 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
     try {
       const hostname = window.location.hostname;
       const isMobile = /Android|iPhone|iPad/i.test(navigator.userAgent);
-      const isLocal = ['localhost', '127.0.0.1'].includes(hostname) || hostname.includes('webcontainer.io');
       
-      if (isLocal && !isMobile) {
+      if (!isMobile) {
         const result = await signInWithPopup(auth, provider);
         await result.user.reload(); // 強制抓取最新的 Profile 資料
         onClose(); 
@@ -469,6 +468,8 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
     } catch (error) {
       if (error.code === 'auth/unauthorized-domain') {
         alert("⚠️ 網域未授權錯誤！\n\n請到 Firebase 後台 -> Authentication -> Settings -> Authorized domains 中新增目前網址！");
+      } else if (error.code === 'auth/popup-closed-by-user') {
+        // 使用者手動關閉彈出視窗，不需報錯
       } else if (error.code === 'auth/admin-restricted-operation' || error.message.includes('restricted')) {
         alert("登入失敗：您的學校帳號 (@go.edu.tw) 可能阻擋了登入，請改用一般 Gmail 帳號測試。");
       } else {
