@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { initializeApp, getApps, getApp } from 'firebase/app';
+import { initializeApp } from 'firebase/app';
 import { 
-  getAuth, signInWithCustomToken, 
+  getAuth, signInWithCustomToken, signInAnonymously, 
   onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, signOut 
 } from 'firebase/auth';
 import { getFirestore, doc, setDoc, onSnapshot, getDoc, serverTimestamp } from 'firebase/firestore';
@@ -12,7 +12,7 @@ import {
   FileDown, CheckSquare, Search, CloudOff, User, LogOut, UserCog,
   Database, RefreshCw, Send
 } from 'lucide-react';
-import * as XLSX from 'xlsx'
+import * as XLSX from 'xlsx';
 
 // ==========================================
 // 🔴 老師請注意：請在此填入您的 Firebase 設定 🔴
@@ -27,51 +27,12 @@ const userFirebaseConfig = {
   measurementId: "G-YGE2HJHNQ9"
 };
 
-// 1. 修復 Firebase 重複初始化問題
+// 系統防呆與環境識別
 const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : userFirebaseConfig;
-const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
+const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'moral-system-pro';
-
-// 6. 安全的 JSON.parse 處理
-const safeParse = (str, fallback = {}) => {
-  if (!str) return fallback;
-  try {
-    return JSON.parse(str) || fallback;
-  } catch {
-    return fallback;
-  }
-};
-
-// 取得使用者顯示名稱 (強制顯示完整的 Google 姓名或 Gmail)
-const getUserDisplayName = (user) => {
-  if (!user) return '未登入';
-
-  // 🚨 新增：明確標示出殘留的匿名訪客帳號，避免誤會
-  if (user.isAnonymous) {
-    return '訪客 (未綁定 Google)';
-  }
-
-  // 1. 優先使用 Google 帳號設定的真實姓名
-  if (user.displayName?.trim()) {
-    return user.displayName;
-  }
-  if (user.providerData?.length > 0 && user.providerData[0].displayName?.trim()) {
-    return user.providerData[0].displayName;
-  }
-
-  // 2. 如果沒有設定姓名，直接顯示完整的 Gmail 帳號 (不再切掉 @gmail.com)
-  if (user.email) {
-    return user.email;
-  }
-  if (user.providerData?.length > 0 && user.providerData[0].email) {
-    return user.providerData[0].email;
-  }
-
-  // 最後防線 (通常是開發者模式的 Custom Token)
-  return `特殊帳號-${user.uid.slice(0, 6)}`;
-};
 
 // ==========================================
 // 共用常數與預設資料
@@ -108,109 +69,94 @@ export default function App() {
   const [isCloudModalOpen, setIsCloudModalOpen] = useState(false);
   const [apiUrl, setApiUrl] = useState('');
   const [syncStatus, setSyncStatus] = useState('idle');
-  
-  const appDataRef = useRef(appData);
-  useEffect(() => {
-    appDataRef.current = appData;
-  }, [appData]);
 
-  // ------------------------------------------
-  // 7. 防 Memory Leak：統一管理 setTimeout
-  // ------------------------------------------
-  const timeoutRef = useRef(null);
-  const resetSyncStatus = (delay = 3000) => {
-    clearTimeout(timeoutRef.current);
-    timeoutRef.current = setTimeout(() => {
-      setSyncStatus('idle');
-    }, delay);
-  };
-  useEffect(() => {
-    return () => clearTimeout(timeoutRef.current);
-  }, []);
-
-  // ------------------------------------------
-  // ★ 終極修復：移除會卡死的鎖，回歸最快速純淨的驗證 ★
-  // ------------------------------------------
+  // 初始化 Firebase 驗證與讀取本地設定
   useEffect(() => {
     const localData = localStorage.getItem('school_moral_data');
     if (localData) {
-      setAppData(repairData(safeParse(localData)));
+      try {
+        setAppData(repairData(JSON.parse(localData)));
+      } catch (e) { console.error('本地資料解析失敗', e); }
     }
     const savedUrl = localStorage.getItem('gas_api_url');
     if (savedUrl) setApiUrl(savedUrl);
 
-    // 背景檢查轉址登入結果並強制 Reload 獲取最新 Profile
-    (async () => {
-      try {
-        const result = await getRedirectResult(auth);
-        if (result?.user) {
-          await result.user.reload();
-        }
-      } catch (error) {
-        console.error("轉址登入發生錯誤:", error);
-        if (error.code === 'auth/unauthorized-domain') {
-          alert("⚠️ 網域未授權！請到 Firebase 後台 Authentication -> Settings 將您的 Vercel 網址加入白名單。");
-        }
-      }
-    })();
+    // 處理轉址登入後可能發生的錯誤
+    getRedirectResult(auth).catch(error => {
+      console.error("轉址登入錯誤:", error);
+    });
 
-    // 最純淨的監聽，保證一秒內解開轉圈圈
-    const unsubscribeAuth = onAuthStateChanged(auth, async (u) => {
+    const unsubscribe = onAuthStateChanged(auth, async (u) => {
       if (u) {
+        // --- 成功偵測到帳號 (Google 登入或訪客) ---
         setUser(u);
-        setAuthLoading(false); // ★ 立刻解除轉圈圈
+        setAuthLoading(false);
         
-        try {
-          const docRef = doc(db, 'artifacts', appId, 'users', u.uid, 'schoolData', 'main');
-          const snap = await getDoc(docRef);
-          
-          if (snap.exists()) {
-            const cloudData = snap.data();
-            const repaired = repairData(cloudData.data);
-            repaired.updatedAtLocal = cloudData.updatedAtLocal || Date.now();
-            setAppData(repaired);
-            localStorage.setItem('school_moral_data', JSON.stringify(repaired));
-          } else {
-            const local = safeParse(localStorage.getItem('school_moral_data'), {});
-            if (local.classes && local.classes.length > 0) {
-              const localTime = Date.now();
-              await setDoc(docRef, {
-                data: local,
-                updatedAt: serverTimestamp(),
-                updatedAtLocal: localTime
-              });
+        // --- 終極強化：匿名轉移與強制拉取機制 ---
+        if (!u.isAnonymous) {
+          try {
+            const docRef = doc(db, 'artifacts', appId, 'users', u.uid, 'schoolData', 'main');
+            const snap = await getDoc(docRef);
+            
+            if (snap.exists()) {
+              // 情境 1：雲端有資料 -> 覆蓋本地 (換手機登入時發生)
+              const cloudData = snap.data();
+              const repaired = repairData(cloudData.data);
+              repaired.updatedAtLocal = cloudData.updatedAtLocal || Date.now();
+              setAppData(repaired);
+              localStorage.setItem('school_moral_data', JSON.stringify(repaired));
+            } else {
+              // 情境 2：雲端沒資料 -> 把本地(訪客模式打的)資料推上去綁定！(防清空)
+              const local = JSON.parse(localStorage.getItem('school_moral_data') || '{}');
+              if (local.classes && local.classes.length > 0) {
+                const localTime = Date.now();
+                await setDoc(docRef, {
+                  data: local,
+                  updatedAt: serverTimestamp(),
+                  updatedAtLocal: localTime
+                });
+              }
             }
+          } catch (err) {
+            console.error("處理雲端資料轉移失敗", err);
           }
-        } catch (err) {
-          console.error("處理雲端資料轉移失敗", err);
         }
       } else {
-        // 確定沒有登入
-        setUser(null);
-        setAuthLoading(false); // ★ 即使沒登入，也立刻解除轉圈圈
+        // --- 這裡才是真正的「未登入」，此時才給予訪客身份！防洗掉轉址登入的關鍵 ---
+        try {
+          if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+            await signInWithCustomToken(auth, __initial_auth_token);
+          } else {
+            await signInAnonymously(auth);
+          }
+        } catch (e) {
+          console.error("Auth Error", e);
+          setAuthLoading(false);
+        }
       }
     });
 
-    return () => unsubscribeAuth();
+    return () => unsubscribe();
   }, []);
 
   // 監聽 Firebase 資料庫變化 (防 Snapshot 競爭)
   useEffect(() => {
-    if (!user) return;
+    if (!user || user.isAnonymous) return;
     const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'schoolData', 'main');
     
     const unsubscribe = onSnapshot(docRef, (docSnap) => {
       if (docSnap.exists()) {
         const cloudDoc = docSnap.data();
-        const localDoc = safeParse(localStorage.getItem('school_moral_data'), {});
+        const localDoc = JSON.parse(localStorage.getItem('school_moral_data') || '{}');
         
+        // --- 核心修正：時間戳比對 (防 Race Condition) ---
         if (!localDoc.updatedAtLocal || (cloudDoc.updatedAtLocal && cloudDoc.updatedAtLocal > localDoc.updatedAtLocal)) {
           const repaired = repairData(cloudDoc.data);
           repaired.updatedAtLocal = cloudDoc.updatedAtLocal;
           setAppData(repaired);
           localStorage.setItem('school_moral_data', JSON.stringify(repaired));
           setSyncStatus('success');
-          resetSyncStatus();
+          setTimeout(() => setSyncStatus('idle'), 3000);
         }
       }
     }, (error) => {
@@ -226,13 +172,15 @@ export default function App() {
     const localTime = Date.now();
     const dataToSave = { ...repairData(newData), updatedAtLocal: localTime };
     
+    // 1. 樂觀更新 UI 與本地
     setAppData(dataToSave); 
     localStorage.setItem('school_moral_data', JSON.stringify(dataToSave)); 
     
     let hasError = false;
     setSyncStatus('syncing');
 
-    if (user) {
+    // 2. [同步 A]：Firebase (帶入 serverTimestamp)
+    if (user && !user.isAnonymous) {
       try {
         const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'schoolData', 'main');
         await setDoc(docRef, { 
@@ -246,6 +194,7 @@ export default function App() {
       }
     }
 
+    // 3. [同步 B]：Google Apps Script
     if (apiUrl) {
       try {
         const res = await fetch(apiUrl, {
@@ -262,14 +211,15 @@ export default function App() {
 
     if (hasError) {
       setSyncStatus('error');
-    } else if (user || apiUrl) {
+    } else if ((user && !user.isAnonymous) || apiUrl) {
       setSyncStatus('success');
-      resetSyncStatus(2000);
+      setTimeout(() => setSyncStatus('idle'), 2000);
     } else {
       setSyncStatus('idle'); 
     }
   };
 
+  // 手動從 GAS 抓取資料
   const fetchFromGasCloud = async (url) => {
     setSyncStatus('syncing');
     try {
@@ -284,7 +234,7 @@ export default function App() {
         setSyncStatus('success');
         showNotification('成功從 Google Sheet 下載最新資料！');
         
-        if (user) {
+        if (user && !user.isAnonymous) {
            const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'schoolData', 'main');
            await setDoc(docRef, { 
              data: repaired, 
@@ -298,13 +248,13 @@ export default function App() {
       setSyncStatus('error');
       showNotification('Google Sheet 下載失敗，請檢查網址設定。');
     }
-    resetSyncStatus();
+    setTimeout(() => setSyncStatus('idle'), 3000);
   };
 
   const handleAddClass = (classData, students) => {
     const newClass = { id: Date.now().toString(), name: classData.name, year: classData.year };
     const newStudents = students.map(s => ({
-      id: `std_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+      id: `std_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       classId: newClass.id, seatNo: s.seatNo, name: s.name
     }));
     saveAppData({
@@ -325,7 +275,7 @@ export default function App() {
 
   const handleAddRecords = (newRecordsArray) => {
     const recordsWithId = newRecordsArray.map(r => ({
-      id: Date.now().toString() + Math.random().toString(36).slice(2, 7), ...r
+      id: Date.now().toString() + Math.random().toString(36).substr(2, 5), ...r
     }));
     saveAppData({ ...appData, records: [...appData.records, ...recordsWithId] });
     showNotification(newRecordsArray.length === 1 ? `已為 ${newRecordsArray[0].studentName} 新增紀錄！` : `批次完成！已新增 ${newRecordsArray.length} 筆紀錄`);
@@ -365,25 +315,10 @@ export default function App() {
             
             <button 
               onClick={() => setIsCloudModalOpen(true)}
-              className="flex items-center gap-2 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 rounded-full transition active:scale-95 text-sm font-bold text-gray-600 max-w-[200px]"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 rounded-full transition active:scale-95 text-sm font-bold text-gray-600"
             >
-              {!user ? (
-                <>
-                  <User className="w-4 h-4" />
-                  <span className="hidden sm:inline truncate">未登入</span>
-                </>
-              ) : (
-                <>
-                  {user?.photoURL && !user.isAnonymous ? (
-                    <img src={user.photoURL} alt="avatar" className="w-5 h-5 rounded-full border border-gray-300" />
-                  ) : (
-                    <CheckCircle2 className={`w-4 h-4 ${user.isAnonymous ? 'text-gray-400' : 'text-green-600'}`} />
-                  )}
-                  <span className={`hidden sm:inline truncate ${user.isAnonymous ? 'text-gray-500' : 'text-indigo-700'}`}>
-                    {getUserDisplayName(user)}
-                  </span>
-                </>
-              )}
+              {user?.isAnonymous ? <User className="w-4 h-4"/> : <CheckCircle2 className="w-4 h-4 text-green-600"/>}
+              {user?.isAnonymous ? '訪客' : '已登入'}
             </button>
           </div>
         </div>
@@ -404,7 +339,7 @@ export default function App() {
           onClose={() => setIsCloudModalOpen(false)}
           onFetchFromGas={() => fetchFromGasCloud(apiUrl)}
           onForcePush={() => {
-            saveAppData(appDataRef.current);
+            saveAppData(appData);
             showNotification("已觸發強制同步上傳！");
           }}
         />
@@ -455,21 +390,10 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
     const provider = new GoogleAuthProvider();
     provider.setCustomParameters({ prompt: 'select_account' }); 
     try {
-      const hostname = window.location.hostname;
-      const isMobile = /Android|iPhone|iPad/i.test(navigator.userAgent);
-      
-      if (!isMobile) {
-        const result = await signInWithPopup(auth, provider);
-        await result.user.reload(); // 強制抓取最新的 Profile 資料
-        onClose(); 
-      } else {
-        await signInWithRedirect(auth, provider);
-      }
+      await signInWithRedirect(auth, provider);
     } catch (error) {
       if (error.code === 'auth/unauthorized-domain') {
         alert("⚠️ 網域未授權錯誤！\n\n請到 Firebase 後台 -> Authentication -> Settings -> Authorized domains 中新增目前網址！");
-      } else if (error.code === 'auth/popup-closed-by-user') {
-        // 使用者手動關閉彈出視窗，不需報錯
       } else if (error.code === 'auth/admin-restricted-operation' || error.message.includes('restricted')) {
         alert("登入失敗：您的學校帳號 (@go.edu.tw) 可能阻擋了登入，請改用一般 Gmail 帳號測試。");
       } else {
@@ -483,6 +407,11 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
     setLoading(true);
     try {
       await signOut(auth);
+      try {
+        await signInAnonymously(auth);
+      } catch (e) {
+        console.warn("匿名登入失敗或未啟用", e);
+      }
     } catch (error) {
       alert("登出發生錯誤：" + error.message);
     }
@@ -503,6 +432,7 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
         </div>
 
         <div className="p-6 overflow-y-auto space-y-6">
+          {/* Firebase 區塊 */}
           <div className="bg-white p-5 rounded-2xl shadow-sm border border-gray-100">
             <div className="flex items-center gap-2 mb-4">
               <Database className="w-5 h-5 text-indigo-500" />
@@ -515,24 +445,24 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
             <div className="bg-gray-50 rounded-xl p-4 flex items-center justify-between mb-4">
                <div className="flex items-center gap-3 overflow-hidden">
                  <div className="w-10 h-10 bg-indigo-100 rounded-full flex items-center justify-center flex-shrink-0 overflow-hidden">
-                    {user?.photoURL && !user.isAnonymous ? (
+                    {user?.photoURL && !user?.isAnonymous ? (
                       <img src={user.photoURL} alt="avatar" className="w-full h-full object-cover" />
                     ) : (
-                      <User className={`w-5 h-5 ${!user || user.isAnonymous ? 'text-gray-400' : 'text-indigo-600'}`} />
+                      <User className={`w-5 h-5 ${user?.isAnonymous ? 'text-gray-400' : 'text-indigo-600'}`} />
                     )}
                  </div>
                  <div className="overflow-hidden">
                    <div className="font-black text-sm text-gray-900 truncate">
-                     {!user ? '目前為本機模式 (未連線雲端)' : getUserDisplayName(user)}
+                     {user?.isAnonymous ? '目前為訪客模式' : (user?.displayName || '已登入')}
                    </div>
                    <div className="text-xs text-gray-500 font-bold truncate w-48 sm:w-56">
-                     {!user ? '資料僅存本機，請登入以自動備份' : user?.email}
+                     {user?.isAnonymous ? '資料僅存本機，切換帳號會自動轉移' : user?.email}
                    </div>
                  </div>
                </div>
             </div>
 
-            {user && !user.isAnonymous && (
+            {!user?.isAnonymous && (
               <button 
                 onClick={() => { onForcePush(); onClose(); }}
                 className="w-full py-3 mb-4 rounded-xl font-black text-white bg-green-600 shadow-md active:scale-95 transition flex items-center justify-center gap-2"
@@ -541,17 +471,10 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
               </button>
             )}
 
-            {!user || user.isAnonymous ? (
-              <div className="flex flex-col gap-2">
-                {user?.isAnonymous && (
-                  <button onClick={handleLogout} disabled={loading} className="w-full py-3 rounded-xl font-black text-red-600 bg-red-50 active:scale-95 transition flex items-center justify-center gap-2">
-                    {loading ? <Loader2 className="animate-spin w-5 h-5"/> : <Trash2 className="w-5 h-5"/>} 清除幽靈訪客帳號
-                  </button>
-                )}
-                <button onClick={handleGoogleLogin} disabled={loading} className="w-full py-3 rounded-xl font-black text-white bg-indigo-600 shadow-md active:scale-95 transition flex items-center justify-center gap-2">
-                  {loading ? <Loader2 className="animate-spin w-5 h-5"/> : <Cloud className="w-5 h-5"/>} 登入個人 Google 帳號
-                </button>
-              </div>
+            {user?.isAnonymous ? (
+              <button onClick={handleGoogleLogin} disabled={loading} className="w-full py-3 rounded-xl font-black text-white bg-indigo-600 shadow-md active:scale-95 transition flex items-center justify-center gap-2">
+                {loading ? <Loader2 className="animate-spin w-5 h-5"/> : <Cloud className="w-5 h-5"/>} 登入個人 Google 帳號
+              </button>
             ) : (
               <div className="flex gap-2">
                 <button onClick={handleLogout} disabled={loading} className="flex-1 py-3 rounded-xl font-black text-red-600 bg-red-50 active:scale-95 transition flex items-center justify-center gap-2">
@@ -564,6 +487,7 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
             )}
           </div>
 
+          {/* GAS 區塊 */}
           <div className="bg-white p-5 rounded-2xl shadow-sm border border-gray-100">
             <div className="flex items-center gap-2 mb-4">
               <FileSpreadsheet className="w-5 h-5 text-green-500" />
@@ -585,12 +509,14 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
               </div>
             </div>
           </div>
+
         </div>
       </div>
     </div>
   );
 }
 
+// 以下保留所有原有的 UI 組件
 function Dashboard({ classes, students, onAddClick, onEnterClass, onDeleteClass }) {
   const [classToDelete, setClassToDelete] = useState(null);
   const [deleteConfirmText, setDeleteConfirmText] = useState('');
@@ -743,69 +669,68 @@ function AddClassView({ onBack, onSave, onNotify }) {
     }
   };
 
-  const readFile = (file) =>
-    new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = e => resolve(e.target.result);
-      reader.onerror = reject;
-      reader.readAsArrayBuffer(file);
-    });
-
   const handleSubmit = async () => {
     if (!className.trim() || !selectedFile) return;
     setIsImporting(true);
     onNotify("正在智慧掃描名單...");
 
     try {
-      const buffer = await readFile(selectedFile);
-      const workbook = XLSX.read(new Uint8Array(buffer), { type: 'array' });
-      const sheet = workbook.Sheets[workbook.SheetNames[0]];
-      const json = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" }); 
-      
-      if (!json.length) throw new Error("檔案為空");
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const workbook = XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
+          const sheet = workbook.Sheets[workbook.SheetNames[0]];
+          const json = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" }); 
+          
+          if (!json.length) throw new Error("檔案為空");
 
-      let headerRowIndex = -1;
-      let sIdx = -1;
-      let nIdx = -1;
+          let headerRowIndex = -1;
+          let sIdx = -1;
+          let nIdx = -1;
 
-      const scanLimit = Math.min(json.length, 10);
-      for (let i = 0; i < scanLimit; i++) {
-        const row = json[i].map(cell => cell.toString().trim());
-        const foundS = row.findIndex(h => h.includes('座號') || h.includes('號碼') || h.includes('學號') || h === 'No');
-        const foundN = row.findIndex(h => h.includes('姓名') || h === 'Name');
+          const scanLimit = Math.min(json.length, 10);
+          for (let i = 0; i < scanLimit; i++) {
+            const row = json[i].map(cell => cell.toString().trim());
+            const foundS = row.findIndex(h => h.includes('座號') || h.includes('號碼') || h.includes('學號') || h === 'No');
+            const foundN = row.findIndex(h => h.includes('姓名') || h === 'Name');
 
-        if (foundS !== -1 && foundN !== -1) {
-          headerRowIndex = i;
-          sIdx = foundS;
-          nIdx = foundN;
-          break; 
+            if (foundS !== -1 && foundN !== -1) {
+              headerRowIndex = i;
+              sIdx = foundS;
+              nIdx = foundN;
+              break; 
+            }
+          }
+
+          if (headerRowIndex === -1) {
+            throw new Error("找不到包含「座號」與「姓名」的標題，請檢查內容。");
+          }
+
+          const students = [];
+          for (let i = headerRowIndex + 1; i < json.length; i++) {
+            const row = json[i];
+            const seatNo = row[sIdx]?.toString().trim();
+            const name = row[nIdx]?.toString().trim();
+
+            if (seatNo || name) {
+              students.push({ 
+                seatNo: seatNo || (students.length + 1), 
+                name: name || "未命名" 
+              });
+            }
+          }
+
+          if (students.length === 0) throw new Error("表頭下方沒有找到學生資料");
+
+          onSave({ name: className, year: new Date().getFullYear() - 1911 }, students);
+        } catch (err) { 
+          onNotify("匯入失敗：" + err.message); 
+          setIsImporting(false); 
         }
-      }
-
-      if (headerRowIndex === -1) {
-        throw new Error("找不到包含「座號」與「姓名」的標題，請檢查內容。");
-      }
-
-      const students = [];
-      for (let i = headerRowIndex + 1; i < json.length; i++) {
-        const row = json[i];
-        const seatNo = row[sIdx]?.toString().trim();
-        const name = row[nIdx]?.toString().trim();
-
-        if (seatNo || name) {
-          students.push({ 
-            seatNo: seatNo || (students.length + 1), 
-            name: name || "未命名" 
-          });
-        }
-      }
-
-      if (students.length === 0) throw new Error("表頭下方沒有找到學生資料");
-
-      onSave({ name: className, year: new Date().getFullYear() - 1911 }, students);
+      };
+      reader.readAsArrayBuffer(selectedFile);
     } catch (err) { 
-      onNotify("匯入失敗：" + err.message); 
-    } finally {
+      onNotify("讀取檔案時發生錯誤"); 
       setIsImporting(false); 
     }
   };
@@ -993,7 +918,7 @@ function EditStudentsModal({ classId, students, onClose, onSave }) {
   const handleAdd = () => {
     if (!newSeat.trim() || !newName.trim()) return;
     const newStudent = {
-      id: `std_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+      id: `std_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
       classId,
       seatNo: newSeat.trim(),
       name: newName.trim()
