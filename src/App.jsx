@@ -27,14 +27,14 @@ const userFirebaseConfig = {
   measurementId: "G-YGE2HJHNQ9"
 };
 
-// 1. 修復 Firebase 重複初始化問題 (支援熱更新)
+// 1. 修復 Firebase 重複初始化問題
 const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : userFirebaseConfig;
 const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'moral-system-pro';
 
-// 6. 安全的 JSON.parse 處理 (防 localStorage 污染導致全站 crash)
+// 6. 安全的 JSON.parse 處理
 const safeParse = (str, fallback = {}) => {
   if (!str) return fallback;
   try {
@@ -79,17 +79,12 @@ export default function App() {
   const [isCloudModalOpen, setIsCloudModalOpen] = useState(false);
   const [apiUrl, setApiUrl] = useState('');
   const [syncStatus, setSyncStatus] = useState('idle');
-
-  // 2. 加入初始化鎖 (防 Firebase 還原登入狀態前被洗掉)
-  const authInitRef = useRef(false);
   
-  // 3. 使用 useRef 追蹤最新的 appData (解決閉包抓到 stale state 的問題)
   const appDataRef = useRef(appData);
   useEffect(() => {
     appDataRef.current = appData;
   }, [appData]);
 
-  // 7. 防 Memory Leak：統一管理 setTimeout
   const timeoutRef = useRef(null);
   const resetSyncStatus = (delay = 3000) => {
     clearTimeout(timeoutRef.current);
@@ -102,7 +97,7 @@ export default function App() {
   }, []);
 
   // ------------------------------------------
-  // ★ 核心修復：Firebase 初始化與登入狀態還原 ★
+  // ★ 核心修復：Firebase 初始化與無死結的登入狀態還原 ★
   // ------------------------------------------
   useEffect(() => {
     const localData = localStorage.getItem('school_moral_data');
@@ -112,75 +107,74 @@ export default function App() {
     const savedUrl = localStorage.getItem('gas_api_url');
     if (savedUrl) setApiUrl(savedUrl);
 
-    const initAuth = async () => {
+    let unsubscribeAuth;
+
+    const initializeAuthentication = async () => {
       try {
-        // 等 Firebase 還原登入狀態
+        // 1. 先等待 Firebase 內部還原登入狀態
         if (auth.authStateReady) {
           await auth.authStateReady();
         }
+        // 2. 確認轉址結果是否回來了
         await getRedirectResult(auth).catch(() => {});
-        
-        authInitRef.current = true;
       } catch (err) {
-        console.error("初始化驗證失敗", err);
-        authInitRef.current = true;
+        console.error("初始化驗證發生錯誤:", err);
       }
+
+      // 3. 所有狀態都確認完畢後，才「開始監聽」
+      // 這樣保證一監聽就立刻拿到正確結果，絕對不會卡死！
+      unsubscribeAuth = onAuthStateChanged(auth, async (u) => {
+        if (u) {
+          setUser(u);
+          setAuthLoading(false); // ★ 確保關閉轉圈圈
+          
+          if (!u.isAnonymous) {
+            try {
+              const docRef = doc(db, 'artifacts', appId, 'users', u.uid, 'schoolData', 'main');
+              const snap = await getDoc(docRef);
+              
+              if (snap.exists()) {
+                const cloudData = snap.data();
+                const repaired = repairData(cloudData.data);
+                repaired.updatedAtLocal = cloudData.updatedAtLocal || Date.now();
+                setAppData(repaired);
+                localStorage.setItem('school_moral_data', JSON.stringify(repaired));
+              } else {
+                const local = safeParse(localStorage.getItem('school_moral_data'), {});
+                if (local.classes && local.classes.length > 0) {
+                  const localTime = Date.now();
+                  await setDoc(docRef, {
+                    data: local,
+                    updatedAt: serverTimestamp(),
+                    updatedAtLocal: localTime
+                  });
+                }
+              }
+            } catch (err) {
+              console.error("處理雲端資料轉移失敗", err);
+            }
+          }
+        } else {
+          // 如果真的沒有帳號，才建立訪客
+          try {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+              await signInWithCustomToken(auth, __initial_auth_token);
+            } else {
+              await signInAnonymously(auth);
+            }
+          } catch (e) {
+            console.error("匿名登入失敗", e);
+          }
+          setAuthLoading(false); // ★ 即使訪客登入失敗也一定要關閉轉圈圈
+        }
+      });
     };
 
-    initAuth();
+    initializeAuthentication();
 
-    const unsubscribe = onAuthStateChanged(auth, async (u) => {
-      // 還沒初始化完成，不處理
-      if (!authInitRef.current) return;
-
-      if (u) {
-        setUser(u);
-        setAuthLoading(false);
-        
-        if (!u.isAnonymous) {
-          try {
-            const docRef = doc(db, 'artifacts', appId, 'users', u.uid, 'schoolData', 'main');
-            const snap = await getDoc(docRef);
-            
-            if (snap.exists()) {
-              const cloudData = snap.data();
-              const repaired = repairData(cloudData.data);
-              repaired.updatedAtLocal = cloudData.updatedAtLocal || Date.now();
-              setAppData(repaired);
-              localStorage.setItem('school_moral_data', JSON.stringify(repaired));
-            } else {
-              const local = safeParse(localStorage.getItem('school_moral_data'), {});
-              if (local.classes && local.classes.length > 0) {
-                const localTime = Date.now();
-                await setDoc(docRef, {
-                  data: local,
-                  updatedAt: serverTimestamp(),
-                  updatedAtLocal: localTime
-                });
-              }
-            }
-          } catch (err) {
-            console.error("處理雲端資料轉移失敗", err);
-          }
-        }
-        return;
-      }
-
-      // 確定完全沒登入才匿名登入
-      try {
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
-        }
-      } catch (e) {
-        console.error("匿名登入失敗", e);
-      }
-      
-      setAuthLoading(false);
-    });
-
-    return () => unsubscribe();
+    return () => {
+      if (unsubscribeAuth) unsubscribeAuth();
+    };
   }, []);
 
   // 監聽 Firebase 資料庫變化 (防 Snapshot 競爭)
@@ -293,7 +287,6 @@ export default function App() {
   const handleAddClass = (classData, students) => {
     const newClass = { id: Date.now().toString(), name: classData.name, year: classData.year };
     const newStudents = students.map(s => ({
-      // 5. 棄用 substr 改用 slice
       id: `std_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
       classId: newClass.id, seatNo: s.seatNo, name: s.name
     }));
@@ -452,13 +445,11 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
     setLoading(false);
   };
 
-  // ★ 登出加入防競爭延遲 ★
   const handleLogout = async () => {
     setLoading(true);
     try {
       await signOut(auth);
 
-      // 延遲 300ms 再轉回匿名，防止 race condition
       setTimeout(async () => {
         try {
           await signInAnonymously(auth);
