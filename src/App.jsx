@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, signInWithCustomToken, signInAnonymously, 
-  onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signInWithRedirect, signOut 
+  onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, signOut 
 } from 'firebase/auth';
 import { getFirestore, doc, setDoc, onSnapshot, getDoc, serverTimestamp } from 'firebase/firestore';
 import { 
@@ -81,53 +81,88 @@ export default function App() {
     const savedUrl = localStorage.getItem('gas_api_url');
     if (savedUrl) setApiUrl(savedUrl);
 
-    const initAuth = async () => {
-      try {
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
-        }
-      } catch (e) {
-        console.error("Auth Error", e);
-      }
-    };
-    initAuth();
+    let isCheckingRedirect = true; // 🛡️ 新增防護標記：等待轉址驗證完成
 
     const unsubscribe = onAuthStateChanged(auth, async (u) => {
-      setUser(u);
-      setAuthLoading(false);
-      
-      // --- 終極強化：匿名轉移與強制拉取機制 ---
-      if (u && !u.isAnonymous) {
-        try {
-          const docRef = doc(db, 'artifacts', appId, 'users', u.uid, 'schoolData', 'main');
-          const snap = await getDoc(docRef);
-          
-          if (snap.exists()) {
-            // 情境 1：雲端有資料 -> 覆蓋本地 (換手機登入時發生)
-            const cloudData = snap.data();
-            const repaired = repairData(cloudData.data);
-            repaired.updatedAtLocal = cloudData.updatedAtLocal || Date.now();
-            setAppData(repaired);
-            localStorage.setItem('school_moral_data', JSON.stringify(repaired));
-          } else {
-            // 情境 2：雲端沒資料 -> 把本地(訪客模式打的)資料推上去綁定！(防清空)
-            const local = JSON.parse(localStorage.getItem('school_moral_data') || '{}');
-            if (local.classes && local.classes.length > 0) {
-              const localTime = Date.now();
-              await setDoc(docRef, {
-                data: local,
-                updatedAt: serverTimestamp(),
-                updatedAtLocal: localTime
-              });
+      if (u) {
+        // --- 成功偵測到帳號 (Google 登入或訪客) ---
+        setUser(u);
+        setAuthLoading(false);
+        
+        // --- 終極強化：匿名轉移與強制拉取機制 ---
+        if (!u.isAnonymous) {
+          try {
+            const docRef = doc(db, 'artifacts', appId, 'users', u.uid, 'schoolData', 'main');
+            const snap = await getDoc(docRef);
+            
+            if (snap.exists()) {
+              // 情境 1：雲端有資料 -> 覆蓋本地 (換手機登入時發生)
+              const cloudData = snap.data();
+              const repaired = repairData(cloudData.data);
+              repaired.updatedAtLocal = cloudData.updatedAtLocal || Date.now();
+              setAppData(repaired);
+              localStorage.setItem('school_moral_data', JSON.stringify(repaired));
+            } else {
+              // 情境 2：雲端沒資料 -> 把本地(訪客模式打的)資料推上去綁定！(防清空)
+              const local = JSON.parse(localStorage.getItem('school_moral_data') || '{}');
+              if (local.classes && local.classes.length > 0) {
+                const localTime = Date.now();
+                await setDoc(docRef, {
+                  data: local,
+                  updatedAt: serverTimestamp(),
+                  updatedAtLocal: localTime
+                });
+              }
             }
+          } catch (err) {
+            console.error("處理雲端資料轉移失敗", err);
           }
-        } catch (err) {
-          console.error("處理雲端資料轉移失敗", err);
+        }
+      } else {
+        // --- 這裡才是真正的「未登入」 ---
+        // 🛡️ 只有在「確定轉址檢查已經結束」時，才給予訪客身份！這是防洗掉 Google 登入的關鍵
+        if (!isCheckingRedirect) {
+          try {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+              await signInWithCustomToken(auth, __initial_auth_token);
+            } else {
+              await signInAnonymously(auth);
+            }
+          } catch (e) {
+            console.error("Auth Error", e);
+            setAuthLoading(false);
+          }
         }
       }
     });
+
+    // 🛡️ 處理轉址登入後的回傳結果 (必須放在 onAuthStateChanged 之後)
+    const checkRedirect = async () => {
+      try {
+        await getRedirectResult(auth);
+      } catch (error) {
+        console.error("轉址登入錯誤:", error);
+      } finally {
+        isCheckingRedirect = false; // 解除防護標記
+        
+        // 檢查完畢後，如果 Firebase 還是沒抓到帳號 (代表真的沒登入)，我們才手動觸發建立訪客
+        if (!auth.currentUser) {
+          try {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+              await signInWithCustomToken(auth, __initial_auth_token);
+            } else {
+              await signInAnonymously(auth);
+            }
+          } catch (e) {
+            console.error("Auth Error", e);
+            setAuthLoading(false);
+          }
+        }
+      }
+    };
+
+    checkRedirect();
+
     return () => unsubscribe();
   }, []);
 
@@ -142,7 +177,6 @@ export default function App() {
         const localDoc = JSON.parse(localStorage.getItem('school_moral_data') || '{}');
         
         // --- 核心修正：時間戳比對 (防 Race Condition) ---
-        // 只有當「雲端的時間戳 > 本地時間戳」或「本地無時間戳」時，才允許覆蓋畫面
         if (!localDoc.updatedAtLocal || (cloudDoc.updatedAtLocal && cloudDoc.updatedAtLocal > localDoc.updatedAtLocal)) {
           const repaired = repairData(cloudDoc.data);
           repaired.updatedAtLocal = cloudDoc.updatedAtLocal;
@@ -178,8 +212,8 @@ export default function App() {
         const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'schoolData', 'main');
         await setDoc(docRef, { 
           data: dataToSave, 
-          updatedAt: serverTimestamp(), // 給資料庫排序用
-          updatedAtLocal: localTime     // 給客戶端防重複覆蓋用
+          updatedAt: serverTimestamp(), 
+          updatedAtLocal: localTime     
         });
       } catch (err) {
         console.error("寫入雲端失敗", err);
@@ -257,7 +291,6 @@ export default function App() {
     showNotification(`已新增班級「${newClass.name}」`);
   };
 
-  // 編輯學生名單 (增刪轉學生)
   const handleUpdateStudents = (classId, updatedStudents) => {
     const otherStudents = appData.students.filter(s => s.classId !== classId);
     saveAppData({
@@ -291,7 +324,7 @@ export default function App() {
   };
 
   if (authLoading) {
-    return <div className="min-h-screen flex items-center justify-center font-bold text-gray-500 gap-2"><Loader2 className="animate-spin" /> 正在初始化系統...</div>;
+    return <div className="min-h-screen flex flex-col items-center justify-center font-bold text-indigo-600 gap-3"><Loader2 className="animate-spin w-8 h-8" /> 系統資料同步中...</div>;
   }
 
   return (
@@ -384,14 +417,26 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
     const provider = new GoogleAuthProvider();
     provider.setCustomParameters({ prompt: 'select_account' }); 
     try {
-      // 這裡直接改成 signInWithRedirect
-      await signInWithRedirect(auth, provider);
+      // 🛡️ 智慧環境偵測
+      const hostname = window.location.hostname;
+      const isSandboxed = hostname.includes('webcontainer.io') || hostname.includes('stackblitz') || hostname === 'localhost';
+      
+      if (isSandboxed) {
+        // 在沙盒測試環境 (如影片中的網址)：強制使用 Popup
+        // 因為沙盒的 iframe 會吃掉轉址回傳的 cookie 導致失敗
+        await signInWithPopup(auth, provider);
+        onClose(); 
+      } else {
+        // 在正式環境 (Vercel 或手機)：使用 Redirect
+        // 這是手機 LINE/FB 內建瀏覽器唯一不會報錯的方法
+        await signInWithRedirect(auth, provider);
+      }
     } catch (error) {
       if (error.code === 'auth/unauthorized-domain') {
         alert("⚠️ 網域未授權錯誤！\n\n請到 Firebase 後台 -> Authentication -> Settings -> Authorized domains 中新增目前網址！");
       } else if (error.code === 'auth/admin-restricted-operation' || error.message.includes('restricted')) {
         alert("登入失敗：您的學校帳號 (@go.edu.tw) 可能阻擋了登入，請改用一般 Gmail 帳號測試。");
-      } else if (error.code !== 'auth/popup-closed-by-user') {
+      } else {
         alert("登入發生錯誤：" + error.message);
       }
     }
@@ -511,7 +556,7 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
   );
 }
 
-// 以下保留所有原有的 UI 組件 (Dashboard, AddClass, ClassManagement 等)
+// 以下保留所有原有的 UI 組件
 function Dashboard({ classes, students, onAddClick, onEnterClass, onDeleteClass }) {
   const [classToDelete, setClassToDelete] = useState(null);
   const [deleteConfirmText, setDeleteConfirmText] = useState('');
