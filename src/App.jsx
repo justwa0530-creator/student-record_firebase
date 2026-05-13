@@ -329,10 +329,25 @@ export default function App() {
             
             <button 
               onClick={() => setIsCloudModalOpen(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 rounded-full transition active:scale-95 text-sm font-bold text-gray-600"
+              className="flex items-center gap-2 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 rounded-full transition active:scale-95 text-sm font-bold text-gray-600 max-w-[200px]"
             >
-              {!user ? <User className="w-4 h-4"/> : <CheckCircle2 className="w-4 h-4 text-green-600"/>}
-              {!user ? '未登入' : '已登入'}
+              {!user ? (
+                <>
+                  <User className="w-4 h-4" />
+                  <span className="hidden sm:inline truncate">未登入</span>
+                </>
+              ) : (
+                <>
+                  {user?.photoURL ? (
+                    <img src={user.photoURL} alt="avatar" className="w-5 h-5 rounded-full border border-gray-300" />
+                  ) : (
+                    <CheckCircle2 className="w-4 h-4 text-green-600" />
+                  )}
+                  <span className="hidden sm:inline truncate text-indigo-700">
+                    {user?.displayName || user?.email?.split('@')[0] || '已登入'}
+                  </span>
+                </>
+              )}
             </button>
           </div>
         </div>
@@ -471,7 +486,7 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
                  </div>
                  <div className="overflow-hidden">
                    <div className="font-black text-sm text-gray-900 truncate">
-                     {!user ? '目前為本機模式 (未連線雲端)' : (user?.displayName || '已登入')}
+                     {!user ? '目前為本機模式 (未連線雲端)' : (user?.displayName || user?.email?.split('@')[0] || '已登入')}
                    </div>
                    <div className="text-xs text-gray-500 font-bold truncate w-48 sm:w-56">
                      {!user ? '資料僅存本機，請登入以自動備份' : user?.email}
