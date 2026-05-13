@@ -44,6 +44,35 @@ const safeParse = (str, fallback = {}) => {
   }
 };
 
+// 取得使用者顯示名稱 (強健的 fallback 機制)
+const getUserDisplayName = (user) => {
+  if (!user) return '未登入';
+
+  if (user.displayName?.trim()) {
+    return user.displayName;
+  }
+
+  if (user.email) {
+    return user.email.split('@')[0];
+  }
+
+  // 深入 providerData 尋找可能延遲同步的資料
+  if (user.providerData?.length > 0) {
+    const providerUser = user.providerData[0];
+
+    if (providerUser.displayName?.trim()) {
+      return providerUser.displayName;
+    }
+
+    if (providerUser.email) {
+      return providerUser.email.split('@')[0];
+    }
+  }
+
+  // 最後防線：顯示 UID
+  return `帳號-${user.uid.slice(0, 6)}`;
+};
+
 // ==========================================
 // 共用常數與預設資料
 // ==========================================
@@ -86,7 +115,7 @@ export default function App() {
   }, [appData]);
 
   // ------------------------------------------
-  // 7. 防 Memory Leak：統一管理 setTimeout (只保留這一個！)
+  // 7. 防 Memory Leak：統一管理 setTimeout
   // ------------------------------------------
   const timeoutRef = useRef(null);
   const resetSyncStatus = (delay = 3000) => {
@@ -110,13 +139,20 @@ export default function App() {
     const savedUrl = localStorage.getItem('gas_api_url');
     if (savedUrl) setApiUrl(savedUrl);
 
-    // 背景檢查轉址登入是否報錯（不阻擋畫面載入）
-    getRedirectResult(auth).catch((error) => {
-      console.error("轉址登入發生錯誤:", error);
-      if (error.code === 'auth/unauthorized-domain') {
-        alert("⚠️ 網域未授權！請到 Firebase 後台 Authentication -> Settings 將您的 Vercel 網址加入白名單。");
+    // 背景檢查轉址登入結果並強制 Reload 獲取最新 Profile
+    (async () => {
+      try {
+        const result = await getRedirectResult(auth);
+        if (result?.user) {
+          await result.user.reload();
+        }
+      } catch (error) {
+        console.error("轉址登入發生錯誤:", error);
+        if (error.code === 'auth/unauthorized-domain') {
+          alert("⚠️ 網域未授權！請到 Firebase 後台 Authentication -> Settings 將您的 Vercel 網址加入白名單。");
+        }
       }
-    });
+    })();
 
     // 最純淨的監聽，保證一秒內解開轉圈圈
     const unsubscribeAuth = onAuthStateChanged(auth, async (u) => {
@@ -160,7 +196,7 @@ export default function App() {
 
   // 監聽 Firebase 資料庫變化 (防 Snapshot 競爭)
   useEffect(() => {
-    if (!user) return; // 🚀 修改：直接判斷是否登入
+    if (!user) return;
     const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'schoolData', 'main');
     
     const unsubscribe = onSnapshot(docRef, (docSnap) => {
@@ -196,7 +232,7 @@ export default function App() {
     let hasError = false;
     setSyncStatus('syncing');
 
-    if (user) { // 🚀 修改：直接判斷是否登入
+    if (user) {
       try {
         const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'schoolData', 'main');
         await setDoc(docRef, { 
@@ -226,7 +262,7 @@ export default function App() {
 
     if (hasError) {
       setSyncStatus('error');
-    } else if (user || apiUrl) { // 🚀 修改：直接判斷是否登入
+    } else if (user || apiUrl) {
       setSyncStatus('success');
       resetSyncStatus(2000);
     } else {
@@ -248,7 +284,7 @@ export default function App() {
         setSyncStatus('success');
         showNotification('成功從 Google Sheet 下載最新資料！');
         
-        if (user) { // 🚀 修改：直接判斷是否登入
+        if (user) {
            const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'schoolData', 'main');
            await setDoc(docRef, { 
              data: repaired, 
@@ -344,7 +380,7 @@ export default function App() {
                     <CheckCircle2 className="w-4 h-4 text-green-600" />
                   )}
                   <span className="hidden sm:inline truncate text-indigo-700">
-                    {user?.displayName || user?.email?.split('@')[0] || '已登入'}
+                    {getUserDisplayName(user)}
                   </span>
                 </>
               )}
@@ -424,7 +460,8 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
       const isLocal = ['localhost', '127.0.0.1'].includes(hostname) || hostname.includes('webcontainer.io');
       
       if (isLocal && !isMobile) {
-        await signInWithPopup(auth, provider);
+        const result = await signInWithPopup(auth, provider);
+        await result.user.reload(); // 強制抓取最新的 Profile 資料
         onClose(); 
       } else {
         await signInWithRedirect(auth, provider);
@@ -445,7 +482,6 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
     setLoading(true);
     try {
       await signOut(auth);
-      // 🚀 核心修改：登出後就維持未登入狀態，不再觸發匿名
     } catch (error) {
       alert("登出發生錯誤：" + error.message);
     }
@@ -486,7 +522,7 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
                  </div>
                  <div className="overflow-hidden">
                    <div className="font-black text-sm text-gray-900 truncate">
-                     {!user ? '目前為本機模式 (未連線雲端)' : (user?.displayName || user?.email?.split('@')[0] || '已登入')}
+                     {!user ? '目前為本機模式 (未連線雲端)' : getUserDisplayName(user)}
                    </div>
                    <div className="text-xs text-gray-500 font-bold truncate w-48 sm:w-56">
                      {!user ? '資料僅存本機，請登入以自動備份' : user?.email}
