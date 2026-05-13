@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
-import { initializeApp } from 'firebase/app';
+import { initializeApp, getApps, getApp } from 'firebase/app';
 import { 
   getAuth, signInWithCustomToken, signInAnonymously, 
   onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, signOut 
@@ -27,12 +27,22 @@ const userFirebaseConfig = {
   measurementId: "G-YGE2HJHNQ9"
 };
 
-// 系統防呆與環境識別
+// 1. 修復 Firebase 重複初始化問題 (支援熱更新)
 const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : userFirebaseConfig;
-const app = initializeApp(firebaseConfig);
+const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'moral-system-pro';
+
+// 6. 安全的 JSON.parse 處理 (防 localStorage 污染導致全站 crash)
+const safeParse = (str, fallback = {}) => {
+  if (!str) return fallback;
+  try {
+    return JSON.parse(str) || fallback;
+  } catch {
+    return fallback;
+  }
+};
 
 // ==========================================
 // 共用常數與預設資料
@@ -70,41 +80,54 @@ export default function App() {
   const [apiUrl, setApiUrl] = useState('');
   const [syncStatus, setSyncStatus] = useState('idle');
 
+  // 2. 使用 useRef 防護 Redirect 狀態 (防 rerender 遺失)
+  const redirectCheckingRef = useRef(true);
+  
+  // 3. 使用 useRef 追蹤最新的 appData (解決閉包抓到 stale state 的問題)
+  const appDataRef = useRef(appData);
+  useEffect(() => {
+    appDataRef.current = appData;
+  }, [appData]);
+
+  // 7. 防 Memory Leak：統一管理 setTimeout
+  const timeoutRef = useRef(null);
+  const resetSyncStatus = (delay = 3000) => {
+    clearTimeout(timeoutRef.current);
+    timeoutRef.current = setTimeout(() => {
+      setSyncStatus('idle');
+    }, delay);
+  };
+  useEffect(() => {
+    return () => clearTimeout(timeoutRef.current);
+  }, []);
+
   // 初始化 Firebase 驗證與讀取本地設定
   useEffect(() => {
     const localData = localStorage.getItem('school_moral_data');
     if (localData) {
-      try {
-        setAppData(repairData(JSON.parse(localData)));
-      } catch (e) { console.error('本地資料解析失敗', e); }
+      setAppData(repairData(safeParse(localData)));
     }
     const savedUrl = localStorage.getItem('gas_api_url');
     if (savedUrl) setApiUrl(savedUrl);
 
-    let isCheckingRedirect = true; // 🛡️ 新增防護標記：等待轉址驗證完成
-
     const unsubscribe = onAuthStateChanged(auth, async (u) => {
       if (u) {
-        // --- 成功偵測到帳號 (Google 登入或訪客) ---
         setUser(u);
         setAuthLoading(false);
         
-        // --- 終極強化：匿名轉移與強制拉取機制 ---
         if (!u.isAnonymous) {
           try {
             const docRef = doc(db, 'artifacts', appId, 'users', u.uid, 'schoolData', 'main');
             const snap = await getDoc(docRef);
             
             if (snap.exists()) {
-              // 情境 1：雲端有資料 -> 覆蓋本地 (換手機登入時發生)
               const cloudData = snap.data();
               const repaired = repairData(cloudData.data);
               repaired.updatedAtLocal = cloudData.updatedAtLocal || Date.now();
               setAppData(repaired);
               localStorage.setItem('school_moral_data', JSON.stringify(repaired));
             } else {
-              // 情境 2：雲端沒資料 -> 把本地(訪客模式打的)資料推上去綁定！(防清空)
-              const local = JSON.parse(localStorage.getItem('school_moral_data') || '{}');
+              const local = safeParse(localStorage.getItem('school_moral_data'), {});
               if (local.classes && local.classes.length > 0) {
                 const localTime = Date.now();
                 await setDoc(docRef, {
@@ -119,9 +142,7 @@ export default function App() {
           }
         }
       } else {
-        // --- 這裡才是真正的「未登入」 ---
-        // 🛡️ 只有在「確定轉址檢查已經結束」時，才給予訪客身份！這是防洗掉 Google 登入的關鍵
-        if (!isCheckingRedirect) {
+        if (!redirectCheckingRef.current) {
           try {
             if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
               await signInWithCustomToken(auth, __initial_auth_token);
@@ -136,16 +157,16 @@ export default function App() {
       }
     });
 
-    // 🛡️ 處理轉址登入後的回傳結果 (必須放在 onAuthStateChanged 之後)
+    // 🛡️ 最重要修正：等待 authStateReady 防止洗掉 Google 帳號
     const checkRedirect = async () => {
       try {
+        await auth.authStateReady?.();
         await getRedirectResult(auth);
       } catch (error) {
         console.error("轉址登入錯誤:", error);
       } finally {
-        isCheckingRedirect = false; // 解除防護標記
+        redirectCheckingRef.current = false; 
         
-        // 檢查完畢後，如果 Firebase 還是沒抓到帳號 (代表真的沒登入)，我們才手動觸發建立訪客
         if (!auth.currentUser) {
           try {
             if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
@@ -174,16 +195,15 @@ export default function App() {
     const unsubscribe = onSnapshot(docRef, (docSnap) => {
       if (docSnap.exists()) {
         const cloudDoc = docSnap.data();
-        const localDoc = JSON.parse(localStorage.getItem('school_moral_data') || '{}');
+        const localDoc = safeParse(localStorage.getItem('school_moral_data'), {});
         
-        // --- 核心修正：時間戳比對 (防 Race Condition) ---
         if (!localDoc.updatedAtLocal || (cloudDoc.updatedAtLocal && cloudDoc.updatedAtLocal > localDoc.updatedAtLocal)) {
           const repaired = repairData(cloudDoc.data);
           repaired.updatedAtLocal = cloudDoc.updatedAtLocal;
           setAppData(repaired);
           localStorage.setItem('school_moral_data', JSON.stringify(repaired));
           setSyncStatus('success');
-          setTimeout(() => setSyncStatus('idle'), 3000);
+          resetSyncStatus();
         }
       }
     }, (error) => {
@@ -199,14 +219,12 @@ export default function App() {
     const localTime = Date.now();
     const dataToSave = { ...repairData(newData), updatedAtLocal: localTime };
     
-    // 1. 樂觀更新 UI 與本地
     setAppData(dataToSave); 
     localStorage.setItem('school_moral_data', JSON.stringify(dataToSave)); 
     
     let hasError = false;
     setSyncStatus('syncing');
 
-    // 2. [同步 A]：Firebase (帶入 serverTimestamp)
     if (user && !user.isAnonymous) {
       try {
         const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'schoolData', 'main');
@@ -221,7 +239,6 @@ export default function App() {
       }
     }
 
-    // 3. [同步 B]：Google Apps Script
     if (apiUrl) {
       try {
         const res = await fetch(apiUrl, {
@@ -240,13 +257,12 @@ export default function App() {
       setSyncStatus('error');
     } else if ((user && !user.isAnonymous) || apiUrl) {
       setSyncStatus('success');
-      setTimeout(() => setSyncStatus('idle'), 2000);
+      resetSyncStatus(2000);
     } else {
       setSyncStatus('idle'); 
     }
   };
 
-  // 手動從 GAS 抓取資料
   const fetchFromGasCloud = async (url) => {
     setSyncStatus('syncing');
     try {
@@ -275,13 +291,14 @@ export default function App() {
       setSyncStatus('error');
       showNotification('Google Sheet 下載失敗，請檢查網址設定。');
     }
-    setTimeout(() => setSyncStatus('idle'), 3000);
+    resetSyncStatus();
   };
 
   const handleAddClass = (classData, students) => {
     const newClass = { id: Date.now().toString(), name: classData.name, year: classData.year };
     const newStudents = students.map(s => ({
-      id: `std_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      // 5. 棄用 substr 改用 slice
+      id: `std_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
       classId: newClass.id, seatNo: s.seatNo, name: s.name
     }));
     saveAppData({
@@ -302,7 +319,7 @@ export default function App() {
 
   const handleAddRecords = (newRecordsArray) => {
     const recordsWithId = newRecordsArray.map(r => ({
-      id: Date.now().toString() + Math.random().toString(36).substr(2, 5), ...r
+      id: Date.now().toString() + Math.random().toString(36).slice(2, 7), ...r
     }));
     saveAppData({ ...appData, records: [...appData.records, ...recordsWithId] });
     showNotification(newRecordsArray.length === 1 ? `已為 ${newRecordsArray[0].studentName} 新增紀錄！` : `批次完成！已新增 ${newRecordsArray.length} 筆紀錄`);
@@ -366,7 +383,8 @@ export default function App() {
           onClose={() => setIsCloudModalOpen(false)}
           onFetchFromGas={() => fetchFromGasCloud(apiUrl)}
           onForcePush={() => {
-            saveAppData(appData);
+            // 修正 closure stale state 問題，精準備份當下最新資料
+            saveAppData(appDataRef.current);
             showNotification("已觸發強制同步上傳！");
           }}
         />
@@ -417,18 +435,15 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
     const provider = new GoogleAuthProvider();
     provider.setCustomParameters({ prompt: 'select_account' }); 
     try {
-      // 🛡️ 智慧環境偵測
+      // 4. 更穩健的環境判斷防禦機制 (支援正式佈署的電腦/手機版分流)
       const hostname = window.location.hostname;
-      const isSandboxed = hostname.includes('webcontainer.io') || hostname.includes('stackblitz') || hostname === 'localhost';
+      const isMobile = /Android|iPhone|iPad/i.test(navigator.userAgent);
+      const isLocal = ['localhost', '127.0.0.1'].includes(hostname) || hostname.includes('webcontainer.io');
       
-      if (isSandboxed) {
-        // 在沙盒測試環境 (如影片中的網址)：強制使用 Popup
-        // 因為沙盒的 iframe 會吃掉轉址回傳的 cookie 導致失敗
+      if (isLocal && !isMobile) {
         await signInWithPopup(auth, provider);
         onClose(); 
       } else {
-        // 在正式環境 (Vercel 或手機)：使用 Redirect
-        // 這是手機 LINE/FB 內建瀏覽器唯一不會報錯的方法
         await signInWithRedirect(auth, provider);
       }
     } catch (error) {
@@ -472,7 +487,6 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
         </div>
 
         <div className="p-6 overflow-y-auto space-y-6">
-          {/* Firebase 區塊 */}
           <div className="bg-white p-5 rounded-2xl shadow-sm border border-gray-100">
             <div className="flex items-center gap-2 mb-4">
               <Database className="w-5 h-5 text-indigo-500" />
@@ -527,7 +541,6 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
             )}
           </div>
 
-          {/* GAS 區塊 */}
           <div className="bg-white p-5 rounded-2xl shadow-sm border border-gray-100">
             <div className="flex items-center gap-2 mb-4">
               <FileSpreadsheet className="w-5 h-5 text-green-500" />
@@ -549,14 +562,12 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
               </div>
             </div>
           </div>
-
         </div>
       </div>
     </div>
   );
 }
 
-// 以下保留所有原有的 UI 組件
 function Dashboard({ classes, students, onAddClick, onEnterClass, onDeleteClass }) {
   const [classToDelete, setClassToDelete] = useState(null);
   const [deleteConfirmText, setDeleteConfirmText] = useState('');
@@ -709,68 +720,70 @@ function AddClassView({ onBack, onSave, onNotify }) {
     }
   };
 
+  // 8. Promise 包裝 FileReader 解決 Race Condition
+  const readFile = (file) =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = e => resolve(e.target.result);
+      reader.onerror = reject;
+      reader.readAsArrayBuffer(file);
+    });
+
   const handleSubmit = async () => {
     if (!className.trim() || !selectedFile) return;
     setIsImporting(true);
     onNotify("正在智慧掃描名單...");
 
     try {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        try {
-          const workbook = XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
-          const sheet = workbook.Sheets[workbook.SheetNames[0]];
-          const json = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" }); 
-          
-          if (!json.length) throw new Error("檔案為空");
+      const buffer = await readFile(selectedFile);
+      const workbook = XLSX.read(new Uint8Array(buffer), { type: 'array' });
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const json = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" }); 
+      
+      if (!json.length) throw new Error("檔案為空");
 
-          let headerRowIndex = -1;
-          let sIdx = -1;
-          let nIdx = -1;
+      let headerRowIndex = -1;
+      let sIdx = -1;
+      let nIdx = -1;
 
-          const scanLimit = Math.min(json.length, 10);
-          for (let i = 0; i < scanLimit; i++) {
-            const row = json[i].map(cell => cell.toString().trim());
-            const foundS = row.findIndex(h => h.includes('座號') || h.includes('號碼') || h.includes('學號') || h === 'No');
-            const foundN = row.findIndex(h => h.includes('姓名') || h === 'Name');
+      const scanLimit = Math.min(json.length, 10);
+      for (let i = 0; i < scanLimit; i++) {
+        const row = json[i].map(cell => cell.toString().trim());
+        const foundS = row.findIndex(h => h.includes('座號') || h.includes('號碼') || h.includes('學號') || h === 'No');
+        const foundN = row.findIndex(h => h.includes('姓名') || h === 'Name');
 
-            if (foundS !== -1 && foundN !== -1) {
-              headerRowIndex = i;
-              sIdx = foundS;
-              nIdx = foundN;
-              break; 
-            }
-          }
-
-          if (headerRowIndex === -1) {
-            throw new Error("找不到包含「座號」與「姓名」的標題，請檢查內容。");
-          }
-
-          const students = [];
-          for (let i = headerRowIndex + 1; i < json.length; i++) {
-            const row = json[i];
-            const seatNo = row[sIdx]?.toString().trim();
-            const name = row[nIdx]?.toString().trim();
-
-            if (seatNo || name) {
-              students.push({ 
-                seatNo: seatNo || (students.length + 1), 
-                name: name || "未命名" 
-              });
-            }
-          }
-
-          if (students.length === 0) throw new Error("表頭下方沒有找到學生資料");
-
-          onSave({ name: className, year: new Date().getFullYear() - 1911 }, students);
-        } catch (err) { 
-          onNotify("匯入失敗：" + err.message); 
-          setIsImporting(false); 
+        if (foundS !== -1 && foundN !== -1) {
+          headerRowIndex = i;
+          sIdx = foundS;
+          nIdx = foundN;
+          break; 
         }
-      };
-      reader.readAsArrayBuffer(selectedFile);
+      }
+
+      if (headerRowIndex === -1) {
+        throw new Error("找不到包含「座號」與「姓名」的標題，請檢查內容。");
+      }
+
+      const students = [];
+      for (let i = headerRowIndex + 1; i < json.length; i++) {
+        const row = json[i];
+        const seatNo = row[sIdx]?.toString().trim();
+        const name = row[nIdx]?.toString().trim();
+
+        if (seatNo || name) {
+          students.push({ 
+            seatNo: seatNo || (students.length + 1), 
+            name: name || "未命名" 
+          });
+        }
+      }
+
+      if (students.length === 0) throw new Error("表頭下方沒有找到學生資料");
+
+      onSave({ name: className, year: new Date().getFullYear() - 1911 }, students);
     } catch (err) { 
-      onNotify("讀取檔案時發生錯誤"); 
+      onNotify("匯入失敗：" + err.message); 
+    } finally {
       setIsImporting(false); 
     }
   };
@@ -958,7 +971,8 @@ function EditStudentsModal({ classId, students, onClose, onSave }) {
   const handleAdd = () => {
     if (!newSeat.trim() || !newName.trim()) return;
     const newStudent = {
-      id: `std_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+      // 5. 棄用 substr 改用 slice
+      id: `std_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       classId,
       seatNo: newSeat.trim(),
       name: newName.trim()
