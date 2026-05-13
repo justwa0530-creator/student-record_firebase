@@ -100,7 +100,7 @@ export default function App() {
   }, []);
 
   // ------------------------------------------
-  // ★ 核心修復：Firebase 初始化與登入狀態還原 ★
+  // ★ 終極修復：移除會卡死的鎖，回歸最快速純淨的驗證 ★
   // ------------------------------------------
   useEffect(() => {
     const localData = localStorage.getItem('school_moral_data');
@@ -110,28 +110,19 @@ export default function App() {
     const savedUrl = localStorage.getItem('gas_api_url');
     if (savedUrl) setApiUrl(savedUrl);
 
-    const initAuth = async () => {
-      try {
-        if (auth.authStateReady) {
-          await auth.authStateReady();
-        }
-        await getRedirectResult(auth).catch(() => {});
-        
-        authInitRef.current = true;
-      } catch (err) {
-        console.error("初始化驗證失敗", err);
-        authInitRef.current = true;
+    // 背景檢查轉址登入是否報錯（不阻擋畫面載入）
+    getRedirectResult(auth).catch((error) => {
+      console.error("轉址登入發生錯誤:", error);
+      if (error.code === 'auth/unauthorized-domain') {
+        alert("⚠️ 網域未授權！請到 Firebase 後台 Authentication -> Settings 將您的 Vercel 網址加入白名單。");
       }
-    };
+    });
 
-    initAuth();
-
-    const unsubscribe = onAuthStateChanged(auth, async (u) => {
-      if (!authInitRef.current) return;
-
+    // 最純淨的監聽，保證一秒內解開轉圈圈
+    const unsubscribeAuth = onAuthStateChanged(auth, async (u) => {
       if (u) {
         setUser(u);
-        setAuthLoading(false);
+        setAuthLoading(false); // ★ 立刻解除轉圈圈
         
         try {
           const docRef = doc(db, 'artifacts', appId, 'users', u.uid, 'schoolData', 'main');
@@ -158,13 +149,13 @@ export default function App() {
           console.error("處理雲端資料轉移失敗", err);
         }
       } else {
-        // 🚀 核心修改：徹底移除匿名登入，沒有帳號就是未登入
+        // 確定沒有登入
         setUser(null);
-        setAuthLoading(false);
+        setAuthLoading(false); // ★ 即使沒登入，也立刻解除轉圈圈
       }
     });
 
-    return () => unsubscribe();
+    return () => unsubscribeAuth();
   }, []);
 
   // 監聽 Firebase 資料庫變化 (防 Snapshot 競爭)
