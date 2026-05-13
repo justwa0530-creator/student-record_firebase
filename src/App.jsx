@@ -48,28 +48,23 @@ const safeParse = (str, fallback = {}) => {
 const getUserDisplayName = (user) => {
   if (!user) return '未登入';
 
+  // 1. 優先使用 Google 帳號設定的真實姓名
   if (user.displayName?.trim()) {
     return user.displayName;
   }
+  if (user.providerData?.length > 0 && user.providerData[0].displayName?.trim()) {
+    return user.providerData[0].displayName;
+  }
 
+  // 2. 如果沒有設定姓名，直接顯示完整的 Gmail 帳號 (不再切掉 @gmail.com)
   if (user.email) {
-    return user.email.split('@')[0];
+    return user.email;
+  }
+  if (user.providerData?.length > 0 && user.providerData[0].email) {
+    return user.providerData[0].email;
   }
 
-  // 深入 providerData 尋找可能延遲同步的資料
-  if (user.providerData?.length > 0) {
-    const providerUser = user.providerData[0];
-
-    if (providerUser.displayName?.trim()) {
-      return providerUser.displayName;
-    }
-
-    if (providerUser.email) {
-      return providerUser.email.split('@')[0];
-    }
-  }
-
-  // 最後防線：顯示 UID
+  // 最後防線
   return `帳號-${user.uid.slice(0, 6)}`;
 };
 
