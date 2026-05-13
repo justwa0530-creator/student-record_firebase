@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { 
-  getAuth, signInWithCustomToken, signInAnonymously, 
+  getAuth, signInWithCustomToken, 
   onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, signOut 
 } from 'firebase/auth';
 import { getFirestore, doc, setDoc, onSnapshot, getDoc, serverTimestamp } from 'firebase/firestore';
@@ -85,6 +85,9 @@ export default function App() {
     appDataRef.current = appData;
   }, [appData]);
 
+  // ------------------------------------------
+  // 7. 防 Memory Leak：統一管理 setTimeout (只保留這一個！)
+  // ------------------------------------------
   const timeoutRef = useRef(null);
   const resetSyncStatus = (delay = 3000) => {
     clearTimeout(timeoutRef.current);
@@ -97,7 +100,7 @@ export default function App() {
   }, []);
 
   // ------------------------------------------
-  // ★ 核心修復：Firebase 初始化與無死結的登入狀態還原 ★
+  // ★ 核心修復：Firebase 初始化與登入狀態還原 ★
   // ------------------------------------------
   useEffect(() => {
     const localData = localStorage.getItem('school_moral_data');
@@ -107,79 +110,66 @@ export default function App() {
     const savedUrl = localStorage.getItem('gas_api_url');
     if (savedUrl) setApiUrl(savedUrl);
 
-    let unsubscribeAuth;
-
-    const initializeAuthentication = async () => {
+    const initAuth = async () => {
       try {
-        // 1. 先等待 Firebase 內部還原登入狀態
         if (auth.authStateReady) {
           await auth.authStateReady();
         }
-        // 2. 確認轉址結果是否回來了
         await getRedirectResult(auth).catch(() => {});
+        
+        authInitRef.current = true;
       } catch (err) {
-        console.error("初始化驗證發生錯誤:", err);
+        console.error("初始化驗證失敗", err);
+        authInitRef.current = true;
       }
+    };
 
-      // 3. 所有狀態都確認完畢後，才「開始監聽」
-      // 這樣保證一監聽就立刻拿到正確結果，絕對不會卡死！
-      unsubscribeAuth = onAuthStateChanged(auth, async (u) => {
-        if (u) {
-          setUser(u);
-          setAuthLoading(false); // ★ 確保關閉轉圈圈
+    initAuth();
+
+    const unsubscribe = onAuthStateChanged(auth, async (u) => {
+      if (!authInitRef.current) return;
+
+      if (u) {
+        setUser(u);
+        setAuthLoading(false);
+        
+        try {
+          const docRef = doc(db, 'artifacts', appId, 'users', u.uid, 'schoolData', 'main');
+          const snap = await getDoc(docRef);
           
-          if (!u.isAnonymous) {
-            try {
-              const docRef = doc(db, 'artifacts', appId, 'users', u.uid, 'schoolData', 'main');
-              const snap = await getDoc(docRef);
-              
-              if (snap.exists()) {
-                const cloudData = snap.data();
-                const repaired = repairData(cloudData.data);
-                repaired.updatedAtLocal = cloudData.updatedAtLocal || Date.now();
-                setAppData(repaired);
-                localStorage.setItem('school_moral_data', JSON.stringify(repaired));
-              } else {
-                const local = safeParse(localStorage.getItem('school_moral_data'), {});
-                if (local.classes && local.classes.length > 0) {
-                  const localTime = Date.now();
-                  await setDoc(docRef, {
-                    data: local,
-                    updatedAt: serverTimestamp(),
-                    updatedAtLocal: localTime
-                  });
-                }
-              }
-            } catch (err) {
-              console.error("處理雲端資料轉移失敗", err);
+          if (snap.exists()) {
+            const cloudData = snap.data();
+            const repaired = repairData(cloudData.data);
+            repaired.updatedAtLocal = cloudData.updatedAtLocal || Date.now();
+            setAppData(repaired);
+            localStorage.setItem('school_moral_data', JSON.stringify(repaired));
+          } else {
+            const local = safeParse(localStorage.getItem('school_moral_data'), {});
+            if (local.classes && local.classes.length > 0) {
+              const localTime = Date.now();
+              await setDoc(docRef, {
+                data: local,
+                updatedAt: serverTimestamp(),
+                updatedAtLocal: localTime
+              });
             }
           }
-        } else {
-          // 如果真的沒有帳號，才建立訪客
-          try {
-            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-              await signInWithCustomToken(auth, __initial_auth_token);
-            } else {
-              await signInAnonymously(auth);
-            }
-          } catch (e) {
-            console.error("匿名登入失敗", e);
-          }
-          setAuthLoading(false); // ★ 即使訪客登入失敗也一定要關閉轉圈圈
+        } catch (err) {
+          console.error("處理雲端資料轉移失敗", err);
         }
-      });
-    };
+      } else {
+        // 🚀 核心修改：徹底移除匿名登入，沒有帳號就是未登入
+        setUser(null);
+        setAuthLoading(false);
+      }
+    });
 
-    initializeAuthentication();
-
-    return () => {
-      if (unsubscribeAuth) unsubscribeAuth();
-    };
+    return () => unsubscribe();
   }, []);
 
   // 監聽 Firebase 資料庫變化 (防 Snapshot 競爭)
   useEffect(() => {
-    if (!user || user.isAnonymous) return;
+    if (!user) return; // 🚀 修改：直接判斷是否登入
     const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'schoolData', 'main');
     
     const unsubscribe = onSnapshot(docRef, (docSnap) => {
@@ -215,7 +205,7 @@ export default function App() {
     let hasError = false;
     setSyncStatus('syncing');
 
-    if (user && !user.isAnonymous) {
+    if (user) { // 🚀 修改：直接判斷是否登入
       try {
         const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'schoolData', 'main');
         await setDoc(docRef, { 
@@ -245,7 +235,7 @@ export default function App() {
 
     if (hasError) {
       setSyncStatus('error');
-    } else if ((user && !user.isAnonymous) || apiUrl) {
+    } else if (user || apiUrl) { // 🚀 修改：直接判斷是否登入
       setSyncStatus('success');
       resetSyncStatus(2000);
     } else {
@@ -267,7 +257,7 @@ export default function App() {
         setSyncStatus('success');
         showNotification('成功從 Google Sheet 下載最新資料！');
         
-        if (user && !user.isAnonymous) {
+        if (user) { // 🚀 修改：直接判斷是否登入
            const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'schoolData', 'main');
            await setDoc(docRef, { 
              data: repaired, 
@@ -350,8 +340,8 @@ export default function App() {
               onClick={() => setIsCloudModalOpen(true)}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-100 hover:bg-gray-200 rounded-full transition active:scale-95 text-sm font-bold text-gray-600"
             >
-              {user?.isAnonymous ? <User className="w-4 h-4"/> : <CheckCircle2 className="w-4 h-4 text-green-600"/>}
-              {user?.isAnonymous ? '訪客' : '已登入'}
+              {!user ? <User className="w-4 h-4"/> : <CheckCircle2 className="w-4 h-4 text-green-600"/>}
+              {!user ? '未登入' : '已登入'}
             </button>
           </div>
         </div>
@@ -449,15 +439,7 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
     setLoading(true);
     try {
       await signOut(auth);
-
-      setTimeout(async () => {
-        try {
-          await signInAnonymously(auth);
-        } catch (e) {
-          console.warn("匿名登入失敗或未啟用", e);
-        }
-      }, 300);
-
+      // 🚀 核心修改：登出後就維持未登入狀態，不再觸發匿名
     } catch (error) {
       alert("登出發生錯誤：" + error.message);
     }
@@ -490,24 +472,24 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
             <div className="bg-gray-50 rounded-xl p-4 flex items-center justify-between mb-4">
                <div className="flex items-center gap-3 overflow-hidden">
                  <div className="w-10 h-10 bg-indigo-100 rounded-full flex items-center justify-center flex-shrink-0 overflow-hidden">
-                    {user?.photoURL && !user?.isAnonymous ? (
+                    {user?.photoURL ? (
                       <img src={user.photoURL} alt="avatar" className="w-full h-full object-cover" />
                     ) : (
-                      <User className={`w-5 h-5 ${user?.isAnonymous ? 'text-gray-400' : 'text-indigo-600'}`} />
+                      <User className={`w-5 h-5 ${!user ? 'text-gray-400' : 'text-indigo-600'}`} />
                     )}
                  </div>
                  <div className="overflow-hidden">
                    <div className="font-black text-sm text-gray-900 truncate">
-                     {user?.isAnonymous ? '目前為訪客模式' : (user?.displayName || '已登入')}
+                     {!user ? '目前為本機模式 (未連線雲端)' : (user?.displayName || '已登入')}
                    </div>
                    <div className="text-xs text-gray-500 font-bold truncate w-48 sm:w-56">
-                     {user?.isAnonymous ? '資料僅存本機，切換帳號會自動轉移' : user?.email}
+                     {!user ? '資料僅存本機，請登入以自動備份' : user?.email}
                    </div>
                  </div>
                </div>
             </div>
 
-            {!user?.isAnonymous && (
+            {user && (
               <button 
                 onClick={() => { onForcePush(); onClose(); }}
                 className="w-full py-3 mb-4 rounded-xl font-black text-white bg-green-600 shadow-md active:scale-95 transition flex items-center justify-center gap-2"
@@ -516,7 +498,7 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
               </button>
             )}
 
-            {user?.isAnonymous ? (
+            {!user ? (
               <button onClick={handleGoogleLogin} disabled={loading} className="w-full py-3 rounded-xl font-black text-white bg-indigo-600 shadow-md active:scale-95 transition flex items-center justify-center gap-2">
                 {loading ? <Loader2 className="animate-spin w-5 h-5"/> : <Cloud className="w-5 h-5"/>} 登入個人 Google 帳號
               </button>
