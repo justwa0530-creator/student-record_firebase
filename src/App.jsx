@@ -64,8 +64,6 @@ const getUserDisplayName = (user) => {
     return user.providerData[0].email;
   }
 
-  // 最後防線
-  return `帳號-${user.uid.slice(0, 6)}`;
 };
 
 // ==========================================
