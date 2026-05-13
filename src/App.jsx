@@ -12,7 +12,7 @@ import {
   FileDown, CheckSquare, Search, CloudOff, User, LogOut, UserCog,
   Database, RefreshCw, Send
 } from 'lucide-react';
-import * as XLSX from 'xlsx';
+import * as XLSX from 'xlsx'
 
 // ==========================================
 // 🔴 老師請注意：請在此填入您的 Firebase 設定 🔴
@@ -44,9 +44,14 @@ const safeParse = (str, fallback = {}) => {
   }
 };
 
-// 取得使用者顯示名稱 (強健的 fallback 機制)
+// 取得使用者顯示名稱 (強制顯示完整的 Google 姓名或 Gmail)
 const getUserDisplayName = (user) => {
   if (!user) return '未登入';
+
+  // 🚨 新增：明確標示出殘留的匿名訪客帳號，避免誤會
+  if (user.isAnonymous) {
+    return '訪客 (未綁定 Google)';
+  }
 
   // 1. 優先使用 Google 帳號設定的真實姓名
   if (user.displayName?.trim()) {
@@ -64,6 +69,8 @@ const getUserDisplayName = (user) => {
     return user.providerData[0].email;
   }
 
+  // 最後防線 (通常是開發者模式的 Custom Token)
+  return `特殊帳號-${user.uid.slice(0, 6)}`;
 };
 
 // ==========================================
@@ -367,12 +374,12 @@ export default function App() {
                 </>
               ) : (
                 <>
-                  {user?.photoURL ? (
+                  {user?.photoURL && !user.isAnonymous ? (
                     <img src={user.photoURL} alt="avatar" className="w-5 h-5 rounded-full border border-gray-300" />
                   ) : (
-                    <CheckCircle2 className="w-4 h-4 text-green-600" />
+                    <CheckCircle2 className={`w-4 h-4 ${user.isAnonymous ? 'text-gray-400' : 'text-green-600'}`} />
                   )}
-                  <span className="hidden sm:inline truncate text-indigo-700">
+                  <span className={`hidden sm:inline truncate ${user.isAnonymous ? 'text-gray-500' : 'text-indigo-700'}`}>
                     {getUserDisplayName(user)}
                   </span>
                 </>
@@ -507,10 +514,10 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
             <div className="bg-gray-50 rounded-xl p-4 flex items-center justify-between mb-4">
                <div className="flex items-center gap-3 overflow-hidden">
                  <div className="w-10 h-10 bg-indigo-100 rounded-full flex items-center justify-center flex-shrink-0 overflow-hidden">
-                    {user?.photoURL ? (
+                    {user?.photoURL && !user.isAnonymous ? (
                       <img src={user.photoURL} alt="avatar" className="w-full h-full object-cover" />
                     ) : (
-                      <User className={`w-5 h-5 ${!user ? 'text-gray-400' : 'text-indigo-600'}`} />
+                      <User className={`w-5 h-5 ${!user || user.isAnonymous ? 'text-gray-400' : 'text-indigo-600'}`} />
                     )}
                  </div>
                  <div className="overflow-hidden">
@@ -524,7 +531,7 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
                </div>
             </div>
 
-            {user && (
+            {user && !user.isAnonymous && (
               <button 
                 onClick={() => { onForcePush(); onClose(); }}
                 className="w-full py-3 mb-4 rounded-xl font-black text-white bg-green-600 shadow-md active:scale-95 transition flex items-center justify-center gap-2"
@@ -533,10 +540,17 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
               </button>
             )}
 
-            {!user ? (
-              <button onClick={handleGoogleLogin} disabled={loading} className="w-full py-3 rounded-xl font-black text-white bg-indigo-600 shadow-md active:scale-95 transition flex items-center justify-center gap-2">
-                {loading ? <Loader2 className="animate-spin w-5 h-5"/> : <Cloud className="w-5 h-5"/>} 登入個人 Google 帳號
-              </button>
+            {!user || user.isAnonymous ? (
+              <div className="flex flex-col gap-2">
+                {user?.isAnonymous && (
+                  <button onClick={handleLogout} disabled={loading} className="w-full py-3 rounded-xl font-black text-red-600 bg-red-50 active:scale-95 transition flex items-center justify-center gap-2">
+                    {loading ? <Loader2 className="animate-spin w-5 h-5"/> : <Trash2 className="w-5 h-5"/>} 清除幽靈訪客帳號
+                  </button>
+                )}
+                <button onClick={handleGoogleLogin} disabled={loading} className="w-full py-3 rounded-xl font-black text-white bg-indigo-600 shadow-md active:scale-95 transition flex items-center justify-center gap-2">
+                  {loading ? <Loader2 className="animate-spin w-5 h-5"/> : <Cloud className="w-5 h-5"/>} 登入個人 Google 帳號
+                </button>
+              </div>
             ) : (
               <div className="flex gap-2">
                 <button onClick={handleLogout} disabled={loading} className="flex-1 py-3 rounded-xl font-black text-red-600 bg-red-50 active:scale-95 transition flex items-center justify-center gap-2">
