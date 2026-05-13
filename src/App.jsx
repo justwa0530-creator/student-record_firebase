@@ -80,8 +80,8 @@ export default function App() {
   const [apiUrl, setApiUrl] = useState('');
   const [syncStatus, setSyncStatus] = useState('idle');
 
-  // 2. 使用 useRef 防護 Redirect 狀態 (防 rerender 遺失)
-  const redirectCheckingRef = useRef(true);
+  // 2. 加入初始化鎖 (防 Firebase 還原登入狀態前被洗掉)
+  const authInitRef = useRef(false);
   
   // 3. 使用 useRef 追蹤最新的 appData (解決閉包抓到 stale state 的問題)
   const appDataRef = useRef(appData);
@@ -101,7 +101,9 @@ export default function App() {
     return () => clearTimeout(timeoutRef.current);
   }, []);
 
-  // 初始化 Firebase 驗證與讀取本地設定
+  // ------------------------------------------
+  // ★ 核心修復：Firebase 初始化與登入狀態還原 ★
+  // ------------------------------------------
   useEffect(() => {
     const localData = localStorage.getItem('school_moral_data');
     if (localData) {
@@ -110,7 +112,27 @@ export default function App() {
     const savedUrl = localStorage.getItem('gas_api_url');
     if (savedUrl) setApiUrl(savedUrl);
 
+    const initAuth = async () => {
+      try {
+        // 等 Firebase 還原登入狀態
+        if (auth.authStateReady) {
+          await auth.authStateReady();
+        }
+        await getRedirectResult(auth).catch(() => {});
+        
+        authInitRef.current = true;
+      } catch (err) {
+        console.error("初始化驗證失敗", err);
+        authInitRef.current = true;
+      }
+    };
+
+    initAuth();
+
     const unsubscribe = onAuthStateChanged(auth, async (u) => {
+      // 還沒初始化完成，不處理
+      if (!authInitRef.current) return;
+
       if (u) {
         setUser(u);
         setAuthLoading(false);
@@ -141,48 +163,22 @@ export default function App() {
             console.error("處理雲端資料轉移失敗", err);
           }
         }
-      } else {
-        if (!redirectCheckingRef.current) {
-          try {
-            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-              await signInWithCustomToken(auth, __initial_auth_token);
-            } else {
-              await signInAnonymously(auth);
-            }
-          } catch (e) {
-            console.error("Auth Error", e);
-            setAuthLoading(false);
-          }
-        }
+        return;
       }
-    });
 
-    // 🛡️ 最重要修正：等待 authStateReady 防止洗掉 Google 帳號
-    const checkRedirect = async () => {
+      // 確定完全沒登入才匿名登入
       try {
-        await auth.authStateReady?.();
-        await getRedirectResult(auth);
-      } catch (error) {
-        console.error("轉址登入錯誤:", error);
-      } finally {
-        redirectCheckingRef.current = false; 
-        
-        if (!auth.currentUser) {
-          try {
-            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-              await signInWithCustomToken(auth, __initial_auth_token);
-            } else {
-              await signInAnonymously(auth);
-            }
-          } catch (e) {
-            console.error("Auth Error", e);
-            setAuthLoading(false);
-          }
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
         }
+      } catch (e) {
+        console.error("匿名登入失敗", e);
       }
-    };
-
-    checkRedirect();
+      
+      setAuthLoading(false);
+    });
 
     return () => unsubscribe();
   }, []);
@@ -383,7 +379,6 @@ export default function App() {
           onClose={() => setIsCloudModalOpen(false)}
           onFetchFromGas={() => fetchFromGasCloud(apiUrl)}
           onForcePush={() => {
-            // 修正 closure stale state 問題，精準備份當下最新資料
             saveAppData(appDataRef.current);
             showNotification("已觸發強制同步上傳！");
           }}
@@ -435,7 +430,6 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
     const provider = new GoogleAuthProvider();
     provider.setCustomParameters({ prompt: 'select_account' }); 
     try {
-      // 4. 更穩健的環境判斷防禦機制 (支援正式佈署的電腦/手機版分流)
       const hostname = window.location.hostname;
       const isMobile = /Android|iPhone|iPad/i.test(navigator.userAgent);
       const isLocal = ['localhost', '127.0.0.1'].includes(hostname) || hostname.includes('webcontainer.io');
@@ -458,15 +452,21 @@ function DualCloudSettingsModal({ user, apiUrl, setApiUrl, onClose, onFetchFromG
     setLoading(false);
   };
 
+  // ★ 登出加入防競爭延遲 ★
   const handleLogout = async () => {
     setLoading(true);
     try {
       await signOut(auth);
-      try {
-        await signInAnonymously(auth);
-      } catch (e) {
-        console.warn("匿名登入失敗或未啟用", e);
-      }
+
+      // 延遲 300ms 再轉回匿名，防止 race condition
+      setTimeout(async () => {
+        try {
+          await signInAnonymously(auth);
+        } catch (e) {
+          console.warn("匿名登入失敗或未啟用", e);
+        }
+      }, 300);
+
     } catch (error) {
       alert("登出發生錯誤：" + error.message);
     }
@@ -720,7 +720,6 @@ function AddClassView({ onBack, onSave, onNotify }) {
     }
   };
 
-  // 8. Promise 包裝 FileReader 解決 Race Condition
   const readFile = (file) =>
     new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -971,8 +970,7 @@ function EditStudentsModal({ classId, students, onClose, onSave }) {
   const handleAdd = () => {
     if (!newSeat.trim() || !newName.trim()) return;
     const newStudent = {
-      // 5. 棄用 substr 改用 slice
-      id: `std_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      id: `std_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
       classId,
       seatNo: newSeat.trim(),
       name: newName.trim()
