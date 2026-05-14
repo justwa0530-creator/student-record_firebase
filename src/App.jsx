@@ -1,12 +1,10 @@
-import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Plus, Minus, Users, Settings, Save, RefreshCw, Trash2, 
-  ChevronRight, ChevronLeft, MoreHorizontal, LogOut, Cloud, 
-  CloudOff, CheckCircle2, AlertCircle, User, LogIn, ShieldCheck,
+  ChevronRight, LogOut, Cloud, CheckCircle2, User, ShieldCheck,
   Check, X, ClipboardList, UserPlus, GraduationCap, UploadCloud,
   FileSpreadsheet, UserCog, FileDown, ThumbsUp, ThumbsDown, Database,
-  CheckSquare, Search, Filter, Download, LayoutDashboard, History,
-  LayoutGrid, List
+  CheckSquare, LayoutDashboard, History, LayoutGrid, List
 } from 'lucide-react';
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { 
@@ -15,7 +13,7 @@ import {
 } from 'firebase/auth';
 import { 
   getFirestore, doc, setDoc, getDoc, collection, onSnapshot, 
-  query, where, deleteDoc, updateDoc, addDoc, writeBatch, serverTimestamp
+  deleteDoc, addDoc, writeBatch
 } from 'firebase/firestore';
 import * as XLSX from 'xlsx';
 
@@ -25,7 +23,7 @@ const CATEGORIES = {
   negative: ['秩序欠佳', '欠繳作業', '工作怠惰', '環境髒亂', '缺乏責任感', '言行不當', '遲到', '其他處罰']
 };
 
-// --- 2. Firebase 初始化 (安全金鑰) ---
+// --- 2. Firebase 初始化 ---
 const userFirebaseConfig = {
   apiKey: "AIzaSyAAu801RjoYkki3JEOw1WPQDGBHxLqAy3U",
   authDomain: "student-record-10391.firebaseapp.com",
@@ -50,7 +48,7 @@ const safeParse = (str, fallback = {}) => {
 
 const getUserDisplayName = (user) => {
   if (!user) return '未登入';
-  if (user.isAnonymous) return '訪客 (未綁定 Google)';
+  if (user.uid === 'local-guest') return '訪客 (本機模式)';
   if (user.displayName?.trim()) return user.displayName;
   if (user.providerData?.length > 0 && user.providerData[0].displayName?.trim()) return user.providerData[0].displayName;
   if (user.email) return user.email;
@@ -63,25 +61,51 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('classes');
   const [selectedClassId, setSelectedClassId] = useState(null);
+  
+  // App 資料狀態
   const [appData, setAppData] = useState({ classes: [], students: [], records: [], settings: { gasUrl: '' } });
   const [syncStatus, setSyncStatus] = useState('idle');
+  
+  // UI 狀態
   const [modalOpen, setModalOpen] = useState(null); // 'score', 'importClass', 'editStudents'
   const [multiSelect, setMultiSelect] = useState([]);
   const [isMultiMode, setIsMultiMode] = useState(false);
   const [viewMode, setViewMode] = useState('grid'); // 'grid' | 'table'
   const [notification, setNotification] = useState(null);
+  const [showGasTutorial, setShowGasTutorial] = useState(false);
 
-  // --- 認證與監聽 ---
+  // --- 1. 初始化讀取本地快取 ---
+  useEffect(() => {
+    const cached = localStorage.getItem('school_moral_v2');
+    if (cached) {
+      const parsed = safeParse(cached);
+      setAppData({
+        classes: parsed.classes || [],
+        students: parsed.students || [],
+        records: parsed.records || [],
+        settings: parsed.settings || { gasUrl: '' }
+      });
+    }
+  }, []);
+
+  // --- 2. 認證與 Firebase 監聽 ---
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (u) => {
-      setUser(u);
+      if (u) {
+        setUser(u);
+      } else {
+        // 避免洗掉手動點擊的 local-guest
+        setUser(prev => prev?.uid === 'local-guest' ? prev : null);
+      }
       setAuthLoading(false);
     });
     return () => unsubscribe();
   }, []);
 
   useEffect(() => {
-    if (!user) return;
+    // 訪客模式不使用 Firebase 監聽，完全依靠本地 state
+    if (!user || user.uid === 'local-guest') return;
+
     const unsubClasses = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, 'classes'), (s) => {
       setAppData(prev => ({ ...prev, classes: s.docs.map(d => ({ id: d.id, ...d.data() })) }));
     });
@@ -105,66 +129,180 @@ export default function App() {
     setTimeout(() => setNotification(null), 3000);
   };
 
-  // --- 動作處理 ---
-  const handleGuestLogin = async () => {
-    setAuthLoading(true);
-    try { await signInAnonymously(auth); } catch (e) {
-      console.warn("Guest login failed", e);
-      setUser({ uid: 'local-guest', isAnonymous: true, displayName: '訪客' });
-      setAuthLoading(false);
-    }
+  // --- 3. 動作處理 (樂觀更新架構) ---
+  const handleGuestLogin = () => {
+    setUser({ uid: 'local-guest', isAnonymous: true, displayName: '訪客' });
   };
 
   const handleGoogleLogin = async () => {
-    try { await signInWithPopup(auth, new GoogleAuthProvider()); } catch (e) { console.error(e); }
+    try { 
+      const provider = new GoogleAuthProvider();
+      provider.setCustomParameters({ prompt: 'select_account' }); 
+      await signInWithPopup(auth, provider); 
+    } catch (e) { console.error(e); }
+  };
+
+  const handleLogout = async () => {
+    if (window.confirm("確定登出系統？(未綁定的訪客資料會保留在瀏覽器中)")) {
+      if (user?.uid !== 'local-guest') {
+        await signOut(auth);
+      }
+      setUser(null);
+    }
   };
 
   const handleAddClass = async (classData, students) => {
-    if (!user) return;
-    try {
-      const newClassRef = await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'classes'), {
-        name: classData.name || "未命名", createdAt: Date.now()
-      });
-      if (students && students.length > 0) {
+    const newClassId = Date.now().toString();
+    const newClass = { id: newClassId, name: classData.name || "未命名", createdAt: Date.now() };
+    
+    const newStudents = (students || []).map(s => ({
+      id: `std_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+      classId: newClassId, name: s.name || "無名", seatNo: s.seatNo || "", totalScore: 0, createdAt: Date.now()
+    }));
+
+    // 樂觀更新
+    setAppData(prev => {
+      const nextData = { ...prev, classes: [...prev.classes, newClass], students: [...prev.students, ...newStudents] };
+      localStorage.setItem('school_moral_v2', JSON.stringify(nextData));
+      return nextData;
+    });
+    setModalOpen(null);
+    showNotify("班級建立成功！");
+
+    // 背景同步 Firebase
+    if (user && user.uid !== 'local-guest') {
+      try {
         const batch = writeBatch(db);
-        students.forEach(s => {
-          const stuRef = doc(collection(db, 'artifacts', appId, 'users', user.uid, 'students'));
-          batch.set(stuRef, { classId: newClassRef.id, name: s.name || "無名", seatNo: s.seatNo || "", totalScore: 0, createdAt: Date.now() });
-        });
+        batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'classes', newClassId), newClass);
+        newStudents.forEach(s => batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'students', s.id), s));
         await batch.commit();
-      }
-      setModalOpen(null);
-      showNotify("班級建立成功！");
-    } catch (error) {
-      console.error("建立班級失敗", error);
-      showNotify("建立班級發生錯誤，請檢查網路連線");
-      setModalOpen(null);
+      } catch (e) { console.error("Firebase sync failed", e); }
     }
   };
 
   const handleDeleteClass = async (id) => {
-    if (!user || !window.confirm("確定刪除班級？此動作無法復原。")) return;
-    await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'classes', id));
+    if (!window.confirm("確定刪除班級？此動作無法復原。")) return;
+    
+    setAppData(prev => {
+      const nextData = {
+        ...prev,
+        classes: prev.classes.filter(c => c.id !== id),
+        students: prev.students.filter(s => s.classId !== id),
+        records: prev.records.filter(r => r.classId !== id)
+      };
+      localStorage.setItem('school_moral_v2', JSON.stringify(nextData));
+      return nextData;
+    });
     if (selectedClassId === id) setSelectedClassId(null);
     showNotify("班級已刪除");
+
+    if (user && user.uid !== 'local-guest') {
+      try { await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'classes', id)); } 
+      catch (e) { console.error(e); }
+    }
   };
 
+  // --- 評分動作 (修復括號錯位問題) ---
   const handleScore = async (studentIds, type, amount, note = "") => {
-    if (!user) return;
-    const batch = writeBatch(db);
     const timestamp = Date.now();
-    studentIds.forEach(sid => {
-      const student = appData.students.find(s => s.id === sid);
-      const newRef = doc(collection(db, 'artifacts', appId, 'users', user.uid, 'records'));
-      batch.set(newRef, {
-        studentId: sid, studentName: student?.name || '未知', classId: student?.classId,
-        type, score: type === 'positive' ? amount : -amount, note, timestamp
-      });
+    const scoreDelta = type === 'positive' ? amount : -amount;
+    
+    // 建立新紀錄物件
+    const newRecords = studentIds.map(sid => {
+      const st = appData.students.find(s => s.id === sid);
+      return {
+        id: `rec_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        studentId: sid, studentName: st?.name || '未知', classId: st?.classId,
+        type, score: scoreDelta, note, timestamp
+      };
     });
-    await batch.commit();
+
+    // 樂觀更新：更新紀錄與學生總分
+    setAppData(prev => {
+      const nextData = {
+        ...prev,
+        records: [...newRecords, ...prev.records].sort((a, b) => b.timestamp - a.timestamp),
+        students: prev.students.map(s => studentIds.includes(s.id) ? { ...s, totalScore: (s.totalScore || 0) + scoreDelta } : s)
+      };
+      localStorage.setItem('school_moral_v2', JSON.stringify(nextData));
+      return nextData;
+    });
+
     setModalOpen(null);
     if (isMultiMode) { setMultiSelect([]); setIsMultiMode(false); }
     showNotify(studentIds.length > 1 ? `已批次新增 ${studentIds.length} 筆紀錄` : "已新增紀錄");
+
+    // 寫入 Firebase
+    if (user && user.uid !== 'local-guest') {
+      try {
+        const batch = writeBatch(db);
+        
+        // 寫入每筆紀錄
+        newRecords.forEach(r => {
+          batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'records', r.id), r);
+        });
+        
+        // 更新每個學生的總分
+        studentIds.forEach(sid => {
+          const st = appData.students.find(s => s.id === sid);
+          batch.update(doc(db, 'artifacts', appId, 'users', user.uid, 'students', sid), { 
+            totalScore: (st?.totalScore || 0) + scoreDelta 
+          });
+        });
+
+        await batch.commit();
+      } catch (e) { console.error("Firebase update failed", e); }
+    }
+  };
+
+  const handleAddStudent = async (classId, seatNo, name) => {
+    const newStudent = { id: `std_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`, classId, seatNo, name, totalScore: 0, createdAt: Date.now() };
+    
+    setAppData(prev => {
+      const nextData = { ...prev, students: [...prev.students, newStudent] };
+      localStorage.setItem('school_moral_v2', JSON.stringify(nextData));
+      return nextData;
+    });
+
+    if (user && user.uid !== 'local-guest') {
+      try { await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'students', newStudent.id), newStudent); } catch(e){}
+    }
+  };
+
+  const handleDeleteStudent = async (id) => {
+    if (!window.confirm("確定移除該名學生？")) return;
+    setAppData(prev => {
+       const nextData = { ...prev, students: prev.students.filter(s => s.id !== id) };
+       localStorage.setItem('school_moral_v2', JSON.stringify(nextData));
+       return nextData;
+    });
+
+    if (user && user.uid !== 'local-guest') {
+      try { await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'students', id)); } catch(e){}
+    }
+  };
+
+  const handleGasManualSync = async () => {
+    if (!appData.settings.gasUrl) {
+      showNotify("請先填寫並儲存 GAS 網址！");
+      return;
+    }
+    setSyncStatus('syncing');
+    try {
+      await fetch(appData.settings.gasUrl, {
+        method: 'POST',
+        body: JSON.stringify({ data: appData }),
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        mode: 'no-cors'
+      });
+      showNotify("✅ 手動備份指令已發送！");
+      setSyncStatus('success');
+      setTimeout(() => setSyncStatus('idle'), 2000);
+    } catch (err) {
+      console.error(err);
+      showNotify("❌ 備份失敗，請檢查網址或權限設定");
+      setSyncStatus('error');
+    }
   };
 
   const handleExport = () => {
@@ -243,18 +381,18 @@ export default function App() {
         <NavButton active={activeTab === 'classes'} onClick={() => setActiveTab('classes')} icon={<Users size={24}/>} label="班級" />
         <NavButton active={activeTab === 'behavior'} onClick={() => setActiveTab('behavior')} icon={<ClipboardList size={24}/>} label="紀錄" />
         <NavButton active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} icon={<Settings size={24}/>} label="設定" />
-        <button onClick={() => signOut(auth)} className="hidden lg:flex mt-auto p-4 text-slate-400 hover:text-red-500 transition-colors">
+        <button onClick={handleLogout} className="hidden lg:flex mt-auto p-4 text-slate-400 hover:text-red-500 transition-colors">
           <LogOut size={24} />
         </button>
       </nav>
 
-      {/* 桌面版專屬：豐富左側邊欄擴充 (當畫面夠大時可以呈現更多資訊) */}
+      {/* 桌面版專屬：豐富左側邊欄擴充 */}
       <aside className="fixed left-24 top-0 bottom-0 w-64 bg-white border-r border-slate-200 hidden 2xl:flex flex-col z-40">
         <div className="p-8 border-b border-slate-100">
           <h2 className="text-2xl font-black text-slate-800 tracking-tight">Moral Pro</h2>
           <p className="text-sm font-bold text-indigo-500 mt-1">學生品德管理系統</p>
         </div>
-        <div className="flex-1 p-6 space-y-2">
+        <div className="flex-1 p-6 space-y-2 overflow-y-auto">
           {appData.classes.length === 0 ? (
             <p className="text-sm font-bold text-slate-400 text-center mt-10">尚無建立班級</p>
           ) : (
@@ -271,19 +409,19 @@ export default function App() {
           )}
         </div>
         
-        {/* 🌟 優化側邊欄下方：顯示帳號頭像與登出按鈕 */}
+        {/* 側邊欄下方：顯示帳號頭像與登出按鈕 */}
         <div className="mt-auto border-t border-slate-100 pt-6 pb-6 px-6">
           <div className="flex items-center justify-between group">
             <div className="flex items-center gap-3 overflow-hidden">
               <div className="w-10 h-10 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center overflow-hidden flex-shrink-0">
-                {user?.photoURL && !user.isAnonymous ? <img src={user.photoURL} alt="avatar" /> : <User className="text-slate-400" size={20} />}
+                {user?.photoURL && user.uid !== 'local-guest' ? <img src={user.photoURL} alt="avatar" /> : <User className="text-slate-400" size={20} />}
               </div>
               <div className="overflow-hidden">
                 <p className="text-sm font-bold truncate text-slate-800">{getUserDisplayName(user)}</p>
-                <p className="text-[10px] text-slate-400 truncate">{user.isAnonymous ? '訪客模式 (本機)' : user.email}</p>
+                <p className="text-[10px] text-slate-400 truncate">{user.uid === 'local-guest' ? '資料僅存本機' : user.email}</p>
               </div>
             </div>
-            <button onClick={() => signOut(auth)} className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition-colors" title="登出系統">
+            <button onClick={handleLogout} className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition-colors" title="登出系統">
               <LogOut size={20} />
             </button>
           </div>
@@ -296,12 +434,18 @@ export default function App() {
             <h1 className="text-3xl font-black tracking-tight text-slate-900">
               {activeTab === 'classes' ? '班級管理' : activeTab === 'behavior' ? '行為計分紀錄' : '系統備份與設定'}
             </h1>
-            <p className="text-slate-500 font-medium mt-1 2xl:hidden">{user.isAnonymous ? '訪客模式 (本機暫存)' : `歡迎回來，${getUserDisplayName(user)}`}</p>
+            <p className="text-slate-500 font-medium mt-1 2xl:hidden">{user.uid === 'local-guest' ? '訪客模式 (本機暫存)' : `歡迎回來，${getUserDisplayName(user)}`}</p>
           </div>
           <div className="flex items-center gap-3 bg-white p-2 rounded-2xl border border-slate-100 shadow-sm">
-            <div className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 ${syncStatus === 'success' ? 'bg-green-50 text-green-600' : 'bg-blue-50 text-blue-600'}`}>
-              <div className={`w-2 h-2 rounded-full ${syncStatus === 'success' ? 'bg-green-500' : 'bg-blue-500 animate-pulse'}`} /> 雲端連線中
-            </div>
+            {user.uid === 'local-guest' ? (
+               <div className="px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 bg-slate-50 text-slate-500">
+                 <div className="w-2 h-2 rounded-full bg-slate-400" /> 離線本機模式
+               </div>
+            ) : (
+               <div className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 ${syncStatus === 'success' ? 'bg-green-50 text-green-600' : 'bg-blue-50 text-blue-600'}`}>
+                 <div className={`w-2 h-2 rounded-full ${syncStatus === 'success' ? 'bg-green-500' : 'bg-blue-500 animate-pulse'}`} /> 雲端連線中
+               </div>
+            )}
           </div>
         </header>
 
@@ -359,7 +503,7 @@ export default function App() {
                 ))}
               </div>
               <div className="flex items-center gap-2 w-full md:w-auto">
-                {/* 🌟 視圖切換 (總表 / 網格卡片) */}
+                {/* 視圖切換 (總表 / 網格卡片) */}
                 <div className="hidden sm:flex items-center bg-slate-200/50 p-1.5 rounded-xl border border-slate-200">
                   <button onClick={() => setViewMode('grid')} className={`p-1.5 rounded-lg transition-all ${viewMode==='grid'?'bg-white shadow-sm text-indigo-600':'text-slate-400 hover:text-slate-600'}`} title="卡片檢視"><LayoutGrid size={18}/></button>
                   <button onClick={() => setViewMode('table')} className={`p-1.5 rounded-lg transition-all ${viewMode==='table'?'bg-white shadow-sm text-indigo-600':'text-slate-400 hover:text-slate-600'}`} title="總表檢視"><List size={18}/></button>
@@ -378,7 +522,7 @@ export default function App() {
               <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
                 <div className="xl:col-span-2">
                    
-                   {/* 🌟 總表檢視 (Table View) */}
+                   {/* 總表檢視 (Table View) */}
                    {viewMode === 'table' ? (
                      <div className="bg-white rounded-[2rem] border border-slate-200 shadow-sm overflow-hidden mb-6">
                        <div className="overflow-x-auto">
@@ -422,7 +566,7 @@ export default function App() {
                        </div>
                      </div>
                    ) : (
-                     // 🌟 網格卡片檢視 (Grid View)
+                     // 網格卡片檢視 (Grid View)
                      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3 lg:gap-4">
                        {activeClassData.students.map(stu => (
                          <div 
@@ -454,8 +598,8 @@ export default function App() {
                      <div className="fixed bottom-24 lg:bottom-10 left-1/2 -translate-x-1/2 bg-slate-900 text-white px-6 py-4 rounded-full flex items-center gap-6 shadow-2xl z-50 animate-in slide-in-from-bottom-10">
                         <span className="text-sm font-black whitespace-nowrap">已選 {multiSelect.length} 人</span>
                         <div className="flex gap-2">
-                          <button onClick={() => setMultiSelect(activeClassData.students.map(s => s.id))} className="bg-white/20 px-4 py-2 rounded-full font-bold text-sm">全選</button>
-                          <button onClick={() => setModalOpen('score')} className="bg-indigo-500 px-6 py-2 rounded-full font-black text-sm">評分</button>
+                          <button onClick={() => setMultiSelect(activeClassData.students.map(s => s.id))} className="bg-white/20 px-4 py-2 rounded-full font-bold text-sm hover:bg-white/30 transition-colors">全選</button>
+                          <button onClick={() => setModalOpen('score')} className="bg-indigo-500 px-6 py-2 rounded-full font-black text-sm hover:bg-indigo-400 transition-colors shadow-lg">評分</button>
                         </div>
                      </div>
                    )}
@@ -499,27 +643,94 @@ export default function App() {
             <div className="bg-white rounded-[2.5rem] border border-slate-100 p-8 shadow-sm">
               <h3 className="font-black text-xl mb-6 flex items-center gap-2"><Database size={24} className="text-green-600"/> GAS 雲端備份設定</h3>
               <p className="text-sm text-slate-500 mb-4 font-medium">您可以將資料備份到 Google Sheets 試算表，請貼上您的 Apps Script 網址：</p>
-              <div className="flex gap-2">
+              
+              <div className="flex flex-col sm:flex-row gap-2 mb-4">
                 <input 
                   type="text" 
                   value={appData.settings.gasUrl || ''} 
-                  onChange={(e) => setAppData({...appData, settings: { ...appData.settings, gasUrl: e.target.value }})}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setAppData(prev => {
+                      const next = {...prev, settings: { ...prev.settings, gasUrl: val }};
+                      localStorage.setItem('school_moral_v2', JSON.stringify(next));
+                      return next;
+                    });
+                  }}
                   className="flex-1 bg-slate-50 border-2 border-slate-100 rounded-xl px-4 py-3 font-medium text-sm focus:border-green-500 outline-none"
                   placeholder="https://script.google.com/macros/s/..."
                 />
+                <div className="flex gap-2">
+                  <button 
+                    onClick={async () => {
+                      if (user && user.uid !== 'local-guest') {
+                        await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'config'), appData.settings);
+                      }
+                      showNotify("網址已儲存至本機");
+                    }}
+                    className="px-6 py-3 bg-slate-100 text-slate-600 rounded-xl font-bold text-sm hover:bg-slate-200 transition-colors whitespace-nowrap"
+                  >儲存網址</button>
+                  <button 
+                    onClick={handleGasManualSync}
+                    className="px-6 py-3 bg-green-600 text-white rounded-xl font-bold text-sm hover:bg-green-700 shadow-md shadow-green-100 transition-colors whitespace-nowrap flex items-center gap-2"
+                  ><RefreshCw size={16} className={syncStatus === 'syncing' ? 'animate-spin' : ''}/> 手動備份</button>
+                </div>
+              </div>
+
+              {/* GAS 教學區塊 */}
+              <div className="mt-6 border-t border-slate-100 pt-6">
                 <button 
-                  onClick={async () => {
-                    if (user) await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'config'), appData.settings);
-                    showNotify("網址已儲存");
-                  }}
-                  className="px-6 py-3 bg-green-600 text-white rounded-xl font-bold text-sm hover:bg-green-700"
-                >儲存</button>
+                  onClick={() => setShowGasTutorial(!showGasTutorial)}
+                  className="text-sm font-bold text-indigo-600 hover:text-indigo-700 flex items-center gap-1"
+                >
+                  {showGasTutorial ? <ChevronRight className="rotate-90 transition-transform" size={16}/> : <ChevronRight className="transition-transform" size={16}/>} 
+                  如何設定 Google Apps Script (GAS) 備份？
+                </button>
+                
+                {showGasTutorial && (
+                  <div className="mt-4 bg-slate-50 p-6 rounded-2xl border border-slate-200 text-sm text-slate-700 space-y-4">
+                    <p className="font-black text-slate-900">1. 建立新的 Google 試算表</p>
+                    <p>在 Google Drive 建立一個空白試算表，點選上方選單的 <strong className="text-slate-900">「擴充功能」 {'>'} 「Apps Script」</strong>。</p>
+                    
+                    <p className="font-black text-slate-900">2. 貼上以下程式碼</p>
+                    <div className="relative group">
+                      <pre className="bg-slate-800 text-slate-50 p-4 rounded-xl overflow-x-auto text-xs font-mono leading-relaxed">
+{`function doPost(e) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  var params = JSON.parse(e.postData.contents);
+  var data = params.data;
+  
+  sheet.clear();
+  sheet.appendRow(['最後備份時間', new Date()]);
+  sheet.appendRow(['系統資料', JSON.stringify(data)]);
+  
+  return ContentService.createTextOutput(JSON.stringify({status: 'success'}))
+    .setMimeType(ContentService.MimeType.JSON);
+}`}
+                      </pre>
+                      <button 
+                        onClick={() => {
+                          const code = `function doPost(e) {\n  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();\n  var params = JSON.parse(e.postData.contents);\n  var data = params.data;\n  sheet.clear();\n  sheet.appendRow(['最後備份時間', new Date()]);\n  sheet.appendRow(['系統資料', JSON.stringify(data)]);\n  return ContentService.createTextOutput(JSON.stringify({status: 'success'})).setMimeType(ContentService.MimeType.JSON);\n}`;
+                          navigator.clipboard.writeText(code).then(() => showNotify("程式碼已複製！"));
+                        }}
+                        className="absolute top-2 right-2 px-3 py-1.5 bg-white/20 hover:bg-white/30 text-white rounded-lg text-xs font-bold transition-colors opacity-0 group-hover:opacity-100"
+                      >複製程式碼</button>
+                    </div>
+
+                    <p className="font-black text-slate-900">3. 發佈部署</p>
+                    <ul className="list-disc pl-5 space-y-1">
+                      <li>點選右上角 <strong className="text-slate-900">「部署」 {'>'} 「新增部署作業」</strong>。</li>
+                      <li>左側齒輪選擇 <strong className="text-slate-900">「網頁應用程式」</strong>。</li>
+                      <li>存取權限設為 <strong className="text-slate-900">「所有人」</strong>。</li>
+                      <li>點選「部署」並授權，複製 <strong className="text-slate-900">「網頁應用程式網址」</strong> 貼到上方的 API 欄位。</li>
+                    </ul>
+                  </div>
+                )}
               </div>
             </div>
 
             <div className="bg-white rounded-[2.5rem] border border-slate-100 p-8 shadow-sm">
                <h3 className="font-black text-xl mb-6 text-slate-800">帳號管理</h3>
-               <button onClick={() => signOut(auth)} className="w-full py-4 bg-red-50 text-red-600 rounded-2xl font-bold hover:bg-red-100 flex items-center justify-center gap-2">
+               <button onClick={handleLogout} className="w-full py-4 bg-red-50 text-red-600 rounded-2xl font-bold hover:bg-red-100 flex items-center justify-center gap-2">
                  <LogOut size={20} /> 登出系統
                </button>
             </div>
@@ -533,7 +744,12 @@ export default function App() {
       </Modal>
 
       <Modal isOpen={modalOpen === 'editStudents'} onClose={() => setModalOpen(null)} title="編輯學生名單">
-        <EditStudentsModal classId={selectedClassId} students={appData.students.filter(s => s.classId === selectedClassId)} user={user} db={db} appId={appId} />
+        <EditStudentsModal 
+          classId={selectedClassId} 
+          students={appData.students.filter(s => s.classId === selectedClassId)} 
+          onAdd={(seatNo, name) => handleAddStudent(selectedClassId, seatNo, name)}
+          onDelete={handleDeleteStudent}
+        />
       </Modal>
 
       <Modal isOpen={modalOpen === 'score'} onClose={() => setModalOpen(null)} title={multiSelect.length === 1 ? appData.students.find(s=>s.id===multiSelect[0])?.name : `批次給分 (${multiSelect.length}人)`}>
@@ -592,9 +808,15 @@ function ImportClassModal({ onSave, showNotify }) {
   };
 
   const handleSubmit = async () => {
-    if (!className.trim()) return showNotify("請輸入班級名稱");
-    if (!selectedFile) return onSave({ name: className.trim() }, []);
-
+    if (!className.trim()) {
+        showNotify("請輸入班級名稱");
+        return;
+    }
+    if (!selectedFile) {
+        onSave({ name: className.trim() }, []);
+        return;
+    }
+    
     setIsImporting(true);
     showNotify("正在掃描名單...");
 
@@ -677,22 +899,14 @@ function ImportClassModal({ onSave, showNotify }) {
   );
 }
 
-function EditStudentsModal({ classId, students, user, db, appId }) {
+function EditStudentsModal({ classId, students, onAdd, onDelete }) {
   const [newSeat, setNewSeat] = useState('');
   const [newName, setNewName] = useState('');
 
-  const addStudent = async () => {
-    if (!newSeat || !newName || !user) return;
-    await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'students'), {
-      classId, seatNo: newSeat, name: newName, totalScore: 0, createdAt: Date.now()
-    });
+  const addStudent = () => {
+    if (!newSeat || !newName) return;
+    onAdd(newSeat, newName);
     setNewSeat(''); setNewName('');
-  };
-
-  const deleteStudent = async (id) => {
-    if (window.confirm("確定移除該名學生？")) {
-      await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'students', id));
-    }
   };
 
   return (
@@ -709,7 +923,7 @@ function EditStudentsModal({ classId, students, user, db, appId }) {
               <span className="w-8 text-center text-xs font-black text-slate-400 bg-slate-50 py-1 rounded-md">{s.seatNo}</span>
               <span className="font-bold text-slate-700">{s.name}</span>
             </div>
-            <button onClick={() => deleteStudent(s.id)} className="text-slate-300 hover:text-red-500 p-1.5 transition-colors"><Trash2 size={16}/></button>
+            <button onClick={() => onDelete(s.id)} className="text-slate-300 hover:text-red-500 p-1.5 transition-colors"><Trash2 size={16}/></button>
           </div>
         ))}
       </div>
