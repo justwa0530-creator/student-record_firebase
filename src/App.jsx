@@ -282,6 +282,7 @@ export default function App() {
     }
   };
 
+  // --- GAS 備份 (上傳) ---
   const handleGasManualSync = async () => {
     if (!appData.settings.gasUrl) {
       showNotify("請先填寫並儲存 GAS 網址！");
@@ -293,7 +294,7 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify({ data: appData }),
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        mode: 'no-cors'
+        redirect: "follow"
       });
       showNotify("✅ 手動備份指令已發送！");
       setSyncStatus('success');
@@ -302,6 +303,51 @@ export default function App() {
       console.error(err);
       showNotify("❌ 備份失敗，請檢查網址或權限設定");
       setSyncStatus('error');
+    }
+  };
+
+  // --- GAS 下載 (初始化恢復) ---
+  const handleGasDownload = async () => {
+    if (!appData.settings.gasUrl) {
+      showNotify("請先填寫 GAS 網址！");
+      return;
+    }
+    if (!window.confirm("這將會覆蓋掉目前的本地資料，確定要從雲端下載嗎？")) return;
+
+    setSyncStatus('syncing');
+    try {
+      const response = await fetch(appData.settings.gasUrl, { redirect: "follow" });
+      const cloudData = await response.json();
+
+      if (cloudData && (cloudData.classes || cloudData.students)) {
+        // 更新本地 State，保留原本的設定
+        setAppData(prev => {
+          const nextData = { ...cloudData, settings: prev.settings };
+          localStorage.setItem('school_moral_v2', JSON.stringify(nextData));
+          return nextData;
+        });
+        
+        // 如果有登入 Firebase，同步回 Firebase
+        if (user && user.uid !== 'local-guest') {
+          const batch = writeBatch(db);
+          (cloudData.classes || []).forEach(c => batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'classes', c.id), c));
+          (cloudData.students || []).forEach(s => batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'students', s.id), s));
+          (cloudData.records || []).forEach(r => batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'records', r.id), r));
+          await batch.commit();
+        }
+        
+        showNotify("✅ 雲端資料下載成功！");
+        setSyncStatus('success');
+      } else {
+        showNotify("⚠️ 雲端目前沒有有效的資料");
+        setSyncStatus('idle');
+      }
+    } catch (err) {
+      console.error(err);
+      showNotify("❌ 下載失敗，請確保已發佈新版 GAS 程式碼");
+      setSyncStatus('error');
+    } finally {
+      setTimeout(() => setSyncStatus('idle'), 2000);
     }
   };
 
@@ -659,49 +705,70 @@ export default function App() {
                   className="flex-1 bg-slate-50 border-2 border-slate-100 rounded-xl px-4 py-3 font-medium text-sm focus:border-green-500 outline-none"
                   placeholder="https://script.google.com/macros/s/..."
                 />
-                <div className="flex gap-2">
-                  <button 
-                    onClick={async () => {
-                      if (user && user.uid !== 'local-guest') {
-                        await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'config'), appData.settings);
-                      }
-                      showNotify("網址已儲存至本機");
-                    }}
-                    className="px-6 py-3 bg-slate-100 text-slate-600 rounded-xl font-bold text-sm hover:bg-slate-200 transition-colors whitespace-nowrap"
-                  >儲存網址</button>
-                  <button 
-                    onClick={handleGasManualSync}
-                    className="px-6 py-3 bg-green-600 text-white rounded-xl font-bold text-sm hover:bg-green-700 shadow-md shadow-green-100 transition-colors whitespace-nowrap flex items-center gap-2"
-                  ><RefreshCw size={16} className={syncStatus === 'syncing' ? 'animate-spin' : ''}/> 手動備份</button>
-                </div>
+                <button 
+                  onClick={async () => {
+                    if (user && user.uid !== 'local-guest') {
+                      await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'config'), appData.settings);
+                    }
+                    showNotify("網址已儲存至本機");
+                  }}
+                  className="px-6 py-3 bg-slate-100 text-slate-600 rounded-xl font-bold text-sm hover:bg-slate-200 transition-colors whitespace-nowrap"
+                >儲存網址</button>
+              </div>
+
+              {/* 上傳與下載按鈕區塊 */}
+              <div className="flex flex-col gap-3 mt-6">
+                <button 
+                  onClick={handleGasManualSync}
+                  className="w-full py-4 bg-indigo-600 text-white rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-indigo-700 transition-colors shadow-md shadow-indigo-100"
+                >
+                  <UploadCloud size={20}/> 將手機資料「備份」到 GAS
+                </button>
+
+                <button 
+                  onClick={handleGasDownload}
+                  className="w-full py-4 bg-amber-50 text-amber-700 border border-amber-200 rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-amber-100 transition-colors"
+                >
+                  <FileDown size={20}/> 從 GAS「下載」舊有資料
+                </button>
+                
+                <p className="text-[10px] text-slate-400 text-center mt-1">
+                  提示：新手機請先點擊「下載」，確認資料無誤後，日常更新再使用「備份」。
+                </p>
               </div>
 
               {/* GAS 教學區塊 */}
-              <div className="mt-6 border-t border-slate-100 pt-6">
+              <div className="mt-8 border-t border-slate-100 pt-6">
                 <button 
                   onClick={() => setShowGasTutorial(!showGasTutorial)}
                   className="text-sm font-bold text-indigo-600 hover:text-indigo-700 flex items-center gap-1"
                 >
                   {showGasTutorial ? <ChevronRight className="rotate-90 transition-transform" size={16}/> : <ChevronRight className="transition-transform" size={16}/>} 
-                  如何設定 Google Apps Script (GAS) 備份？
+                  如何設定 Google Apps Script (GAS) 雙向同步？
                 </button>
                 
                 {showGasTutorial && (
                   <div className="mt-4 bg-slate-50 p-6 rounded-2xl border border-slate-200 text-sm text-slate-700 space-y-4">
                     <p className="font-black text-slate-900">1. 建立新的 Google 試算表</p>
-                    <p>在 Google Drive 建立一個空白試算表，點選上方選單的 <strong className="text-slate-900">「擴充功能」 {'>'} 「Apps Script」</strong>。</p>
+                    <p>在 Google Drive 建立空白試算表，點選上方選單 <strong className="text-slate-900">「擴充功能」 {'>'} 「Apps Script」</strong>。</p>
                     
-                    <p className="font-black text-slate-900">2. 貼上以下程式碼</p>
+                    <p className="font-black text-slate-900">2. 貼上以下全新程式碼 (支援下載與上傳)</p>
                     <div className="relative group">
                       <pre className="bg-slate-800 text-slate-50 p-4 rounded-xl overflow-x-auto text-xs font-mono leading-relaxed">
-{`function doPost(e) {
+{`function doGet(e) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  var dataStr = sheet.getRange("A2").getValue();
+  return ContentService.createTextOutput(dataStr || "{}")
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function doPost(e) {
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
   var params = JSON.parse(e.postData.contents);
-  var data = params.data;
   
   sheet.clear();
-  sheet.appendRow(['最後備份時間', new Date()]);
-  sheet.appendRow(['系統資料', JSON.stringify(data)]);
+  sheet.appendRow(['最後同步時間', new Date()]);
+  sheet.appendRow([JSON.stringify(params.data)]);
   
   return ContentService.createTextOutput(JSON.stringify({status: 'success'}))
     .setMimeType(ContentService.MimeType.JSON);
@@ -709,19 +776,17 @@ export default function App() {
                       </pre>
                       <button 
                         onClick={() => {
-                          const code = `function doPost(e) {\n  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();\n  var params = JSON.parse(e.postData.contents);\n  var data = params.data;\n  sheet.clear();\n  sheet.appendRow(['最後備份時間', new Date()]);\n  sheet.appendRow(['系統資料', JSON.stringify(data)]);\n  return ContentService.createTextOutput(JSON.stringify({status: 'success'})).setMimeType(ContentService.MimeType.JSON);\n}`;
+                          const code = `function doGet(e) {\n  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();\n  var dataStr = sheet.getRange("A2").getValue();\n  return ContentService.createTextOutput(dataStr || "{}").setMimeType(ContentService.MimeType.JSON);\n}\n\nfunction doPost(e) {\n  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();\n  var params = JSON.parse(e.postData.contents);\n  sheet.clear();\n  sheet.appendRow(['最後同步時間', new Date()]);\n  sheet.appendRow([JSON.stringify(params.data)]);\n  return ContentService.createTextOutput(JSON.stringify({status: 'success'})).setMimeType(ContentService.MimeType.JSON);\n}`;
                           navigator.clipboard.writeText(code).then(() => showNotify("程式碼已複製！"));
                         }}
                         className="absolute top-2 right-2 px-3 py-1.5 bg-white/20 hover:bg-white/30 text-white rounded-lg text-xs font-bold transition-colors opacity-0 group-hover:opacity-100"
                       >複製程式碼</button>
                     </div>
 
-                    <p className="font-black text-slate-900">3. 發佈部署</p>
+                    <p className="font-black text-slate-900">3. 發佈部署 (必看⚠️)</p>
                     <ul className="list-disc pl-5 space-y-1">
-                      <li>點選右上角 <strong className="text-slate-900">「部署」 {'>'} 「新增部署作業」</strong>。</li>
-                      <li>左側齒輪選擇 <strong className="text-slate-900">「網頁應用程式」</strong>。</li>
-                      <li>存取權限設為 <strong className="text-slate-900">「所有人」</strong>。</li>
-                      <li>點選「部署」並授權，複製 <strong className="text-slate-900">「網頁應用程式網址」</strong> 貼到上方的 API 欄位。</li>
+                      <li>若您<strong className="text-red-600">曾經部署過</strong>，請點「部署」{'>'}「管理部署作業」，點擊鉛筆圖示，在「版本」選擇<strong className="text-red-600">「建立新版本」</strong>後儲存。</li>
+                      <li>若是<strong className="text-slate-900">首次部署</strong>：點「新增部署作業」{'>'}「網頁應用程式」{'>'} 權限設為「所有人」，複製網址貼入上方。</li>
                     </ul>
                   </div>
                 )}
