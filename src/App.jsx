@@ -67,10 +67,10 @@ export default function App() {
   const [syncStatus, setSyncStatus] = useState('idle');
   
   // UI 狀態
-  const [modalOpen, setModalOpen] = useState(null); // 'score', 'importClass', 'editStudents'
+  const [modalOpen, setModalOpen] = useState(null);
   const [multiSelect, setMultiSelect] = useState([]);
   const [isMultiMode, setIsMultiMode] = useState(false);
-  const [viewMode, setViewMode] = useState('grid'); // 'grid' | 'table'
+  const [viewMode, setViewMode] = useState('grid');
   const [notification, setNotification] = useState(null);
   const [showGasTutorial, setShowGasTutorial] = useState(false);
 
@@ -94,7 +94,6 @@ export default function App() {
       if (u) {
         setUser(u);
       } else {
-        // 避免洗掉手動點擊的 local-guest
         setUser(prev => prev?.uid === 'local-guest' ? prev : null);
       }
       setAuthLoading(false);
@@ -103,7 +102,6 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    // 訪客模式不使用 Firebase 監聽，完全依靠本地 state
     if (!user || user.uid === 'local-guest') return;
 
     const unsubClasses = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, 'classes'), (s) => {
@@ -160,7 +158,6 @@ export default function App() {
       classId: newClassId, name: s.name || "無名", seatNo: s.seatNo || "", totalScore: 0, createdAt: Date.now()
     }));
 
-    // 樂觀更新
     setAppData(prev => {
       const nextData = { ...prev, classes: [...prev.classes, newClass], students: [...prev.students, ...newStudents] };
       localStorage.setItem('school_moral_v2', JSON.stringify(nextData));
@@ -169,7 +166,6 @@ export default function App() {
     setModalOpen(null);
     showNotify("班級建立成功！");
 
-    // 背景同步 Firebase
     if (user && user.uid !== 'local-guest') {
       try {
         const batch = writeBatch(db);
@@ -202,22 +198,20 @@ export default function App() {
     }
   };
 
-  // --- 評分動作 (修復括號錯位問題) ---
-  const handleScore = async (studentIds, type, amount, note = "") => {
+  // --- 評分動作 (已修正加入 item 項目) ---
+  const handleScore = async (studentIds, type, item, amount, note = "") => {
     const timestamp = Date.now();
     const scoreDelta = type === 'positive' ? amount : -amount;
     
-    // 建立新紀錄物件
     const newRecords = studentIds.map(sid => {
       const st = appData.students.find(s => s.id === sid);
       return {
         id: `rec_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
         studentId: sid, studentName: st?.name || '未知', classId: st?.classId,
-        type, score: scoreDelta, note, timestamp
+        type, item, score: scoreDelta, note, timestamp
       };
     });
 
-    // 樂觀更新：更新紀錄與學生總分
     setAppData(prev => {
       const nextData = {
         ...prev,
@@ -232,24 +226,16 @@ export default function App() {
     if (isMultiMode) { setMultiSelect([]); setIsMultiMode(false); }
     showNotify(studentIds.length > 1 ? `已批次新增 ${studentIds.length} 筆紀錄` : "已新增紀錄");
 
-    // 寫入 Firebase
     if (user && user.uid !== 'local-guest') {
       try {
         const batch = writeBatch(db);
-        
-        // 寫入每筆紀錄
-        newRecords.forEach(r => {
-          batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'records', r.id), r);
-        });
-        
-        // 更新每個學生的總分
+        newRecords.forEach(r => batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'records', r.id), r));
         studentIds.forEach(sid => {
           const st = appData.students.find(s => s.id === sid);
           batch.update(doc(db, 'artifacts', appId, 'users', user.uid, 'students', sid), { 
             totalScore: (st?.totalScore || 0) + scoreDelta 
           });
         });
-
         await batch.commit();
       } catch (e) { console.error("Firebase update failed", e); }
     }
@@ -282,7 +268,6 @@ export default function App() {
     }
   };
 
-  // --- GAS 備份 (上傳) ---
   const handleGasManualSync = async () => {
     if (!appData.settings.gasUrl) {
       showNotify("請先填寫並儲存 GAS 網址！");
@@ -306,7 +291,6 @@ export default function App() {
     }
   };
 
-  // --- GAS 下載 (初始化恢復) ---
   const handleGasDownload = async () => {
     if (!appData.settings.gasUrl) {
       showNotify("請先填寫 GAS 網址！");
@@ -320,19 +304,29 @@ export default function App() {
       const cloudData = await response.json();
 
       if (cloudData && (cloudData.classes || cloudData.students)) {
-        // 更新本地 State，保留原本的設定
+        
+        // --- 容錯處理：相容舊版資料 ---
+        const normalizedRecords = (cloudData.records || []).map(r => ({
+          ...r,
+          timestamp: r.timestamp || (r.date ? new Date(r.date).getTime() : Date.now()),
+          score: r.score !== undefined ? r.score : (r.points !== undefined ? r.points : 0),
+          item: r.item || '未分類',
+          note: r.note || ''
+        }));
+        
+        cloudData.records = normalizedRecords;
+        
         setAppData(prev => {
           const nextData = { ...cloudData, settings: prev.settings };
           localStorage.setItem('school_moral_v2', JSON.stringify(nextData));
           return nextData;
         });
         
-        // 如果有登入 Firebase，同步回 Firebase
         if (user && user.uid !== 'local-guest') {
           const batch = writeBatch(db);
           (cloudData.classes || []).forEach(c => batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'classes', c.id), c));
           (cloudData.students || []).forEach(s => batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'students', s.id), s));
-          (cloudData.records || []).forEach(r => batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'records', r.id), r));
+          normalizedRecords.forEach(r => batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'records', r.id), r));
           await batch.commit();
         }
         
@@ -352,11 +346,11 @@ export default function App() {
   };
 
   const handleExport = () => {
-    const csvContent = "\uFEFF" + "日期,學生,班級,類型,分數,備註\n" +
+    const csvContent = "\uFEFF" + "日期,學生,班級,類型,項目,分數,備註\n" +
       appData.records.filter(r => r.classId === selectedClassId).map(r => {
         const date = new Date(r.timestamp).toLocaleDateString();
         const cls = appData.classes.find(c => c.id === r.classId)?.name || '未知';
-        return `${date},${r.studentName},${cls},${r.type === 'positive' ? '獎勵' : '懲處'},${r.score},${r.note}`;
+        return `${date},${r.studentName},${cls},${r.type === 'positive' ? '獎勵' : '懲處'},${r.item || ''},${r.score},${r.note}`;
       }).join("\n");
     const link = document.createElement("a");
     link.href = URL.createObjectURL(new Blob([csvContent], { type: 'text/csv;charset=utf-8;' }));
@@ -373,9 +367,9 @@ export default function App() {
       const sRecs = appData.records.filter(r => r.studentId === s.id);
       return {
         ...s,
-        totalPoints: sRecs.reduce((sum, r) => sum + r.score, 0),
-        positivePoints: sRecs.filter(r => r.type === 'positive').reduce((sum, r) => sum + r.score, 0),
-        negativePoints: sRecs.filter(r => r.type === 'negative').reduce((sum, r) => sum + r.score, 0)
+        totalPoints: sRecs.reduce((sum, r) => sum + (r.score || 0), 0),
+        positivePoints: sRecs.filter(r => r.type === 'positive').reduce((sum, r) => sum + (r.score || 0), 0),
+        negativePoints: sRecs.filter(r => r.type === 'negative').reduce((sum, r) => sum + (r.score || 0), 0)
       };
     }).sort((a, b) => (parseInt(a.seatNo) || 0) - (parseInt(b.seatNo) || 0));
     return { ...cls, students: studentsWithPoints };
@@ -657,7 +651,10 @@ export default function App() {
                      <h3 className="font-black text-lg flex items-center gap-2"><History size={20} className="text-indigo-600" /> 最近活動</h3>
                    </div>
                    <div className="space-y-4 max-h-[500px] overflow-y-auto pr-2">
-                     {appData.records.filter(r => r.classId === selectedClassId).slice(0, 15).map(rec => (
+                     {appData.records.filter(r => r.classId === selectedClassId).slice(0, 15).map(rec => {
+                       const isValidDate = rec.timestamp && !isNaN(new Date(rec.timestamp).getTime());
+                       const timeStr = isValidDate ? new Date(rec.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+                       return (
                        <div key={rec.id} className="flex gap-3 p-3 rounded-2xl bg-slate-50 border border-slate-100">
                          <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${rec.type === 'positive' ? 'bg-green-100 text-green-600' : 'bg-red-100 text-red-600'}`}>
                            {rec.type === 'positive' ? <ThumbsUp size={16} /> : <ThumbsDown size={16} />}
@@ -665,12 +662,12 @@ export default function App() {
                          <div className="flex-1 min-w-0">
                            <div className="flex justify-between items-center">
                              <p className="font-bold text-sm text-slate-800 truncate">{rec.studentName}</p>
-                             <span className="text-[10px] font-bold text-slate-400">{new Date(rec.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                             <span className="text-[10px] font-bold text-slate-400">{timeStr}</span>
                            </div>
-                           <p className="text-xs text-slate-500 font-medium truncate">{rec.note || rec.item} ({rec.score > 0 ? '+' : ''}{rec.score})</p>
+                           <p className="text-xs text-slate-500 font-medium truncate">{rec.item || '未分類'} ({rec.score > 0 ? '+' : ''}{rec.score}) {rec.note ? `- ${rec.note}` : ''}</p>
                          </div>
                        </div>
-                     ))}
+                     )})}
                      {appData.records.filter(r => r.classId === selectedClassId).length === 0 && (
                        <p className="text-center py-10 text-slate-400 text-sm font-medium">尚無計分紀錄</p>
                      )}
@@ -687,8 +684,8 @@ export default function App() {
         {activeTab === 'settings' && (
           <div className="max-w-2xl space-y-6">
             <div className="bg-white rounded-[2.5rem] border border-slate-100 p-8 shadow-sm">
-              <h3 className="font-black text-xl mb-6 flex items-center gap-2"><Database size={24} className="text-green-600"/> GAS 雲端備份設定</h3>
-              <p className="text-sm text-slate-500 mb-4 font-medium">您可以將資料備份到 Google Sheets 試算表，請貼上您的 Apps Script 網址：</p>
+              <h3 className="font-black text-xl mb-6 flex items-center gap-2"><Database size={24} className="text-green-600"/> GAS 雲端雙向同步</h3>
+              <p className="text-sm text-slate-500 mb-4 font-medium">系統已完美支援與舊版試算表結構相容，並自動將舊資料轉換升級：</p>
               
               <div className="flex flex-col sm:flex-row gap-2 mb-4">
                 <input 
@@ -722,72 +719,121 @@ export default function App() {
                   onClick={handleGasManualSync}
                   className="w-full py-4 bg-indigo-600 text-white rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-indigo-700 transition-colors shadow-md shadow-indigo-100"
                 >
-                  <UploadCloud size={20}/> 將手機資料「備份」到 GAS
+                  <UploadCloud size={20}/> 將手機資料「備份上傳」到 GAS
                 </button>
 
                 <button 
                   onClick={handleGasDownload}
                   className="w-full py-4 bg-amber-50 text-amber-700 border border-amber-200 rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-amber-100 transition-colors"
                 >
-                  <FileDown size={20}/> 從 GAS「下載」舊有資料
+                  <FileDown size={20}/> 從 GAS「下載舊資料」並自動修復相容
                 </button>
                 
                 <p className="text-[10px] text-slate-400 text-center mt-1">
-                  提示：新手機請先點擊「下載」，確認資料無誤後，日常更新再使用「備份」。
+                  提示：若點擊下載，系統會自動將舊版的「日期」及「點數」轉換為新版格式。
                 </p>
               </div>
 
-              {/* GAS 教學區塊 */}
+              {/* GAS 教學區塊 (包含新版完美相容腳本) */}
               <div className="mt-8 border-t border-slate-100 pt-6">
                 <button 
                   onClick={() => setShowGasTutorial(!showGasTutorial)}
                   className="text-sm font-bold text-indigo-600 hover:text-indigo-700 flex items-center gap-1"
                 >
                   {showGasTutorial ? <ChevronRight className="rotate-90 transition-transform" size={16}/> : <ChevronRight className="transition-transform" size={16}/>} 
-                  如何設定 Google Apps Script (GAS) 雙向同步？
+                  如何設定支援「雙向同步」與「Excel 自動分類」的 GAS 程式碼？
                 </button>
                 
                 {showGasTutorial && (
                   <div className="mt-4 bg-slate-50 p-6 rounded-2xl border border-slate-200 text-sm text-slate-700 space-y-4">
-                    <p className="font-black text-slate-900">1. 建立新的 Google 試算表</p>
-                    <p>在 Google Drive 建立空白試算表，點選上方選單 <strong className="text-slate-900">「擴充功能」 {'>'} 「Apps Script」</strong>。</p>
+                    <p className="font-black text-slate-900">這是一份升級版的 GAS 程式碼，完美結合了舊版的「各班獨立工作表分類」以及新版的「JSON 即時同步」功能。</p>
                     
-                    <p className="font-black text-slate-900">2. 貼上以下全新程式碼 (支援下載與上傳)</p>
+                    <p className="font-black text-slate-900">1. 在 Google 試算表中，開啟「擴充功能」 {'>'} 「Apps Script」</p>
+                    <p className="font-black text-slate-900">2. 貼上以下全新程式碼：</p>
                     <div className="relative group">
-                      <pre className="bg-slate-800 text-slate-50 p-4 rounded-xl overflow-x-auto text-xs font-mono leading-relaxed">
+                      <pre className="bg-slate-800 text-slate-50 p-4 rounded-xl overflow-x-auto text-xs font-mono leading-relaxed max-h-60 overflow-y-auto">
 {`function doGet(e) {
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-  var dataStr = sheet.getRange("A2").getValue();
-  return ContentService.createTextOutput(dataStr || "{}")
-    .setMimeType(ContentService.MimeType.JSON);
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var dbSheet = ss.getSheetByName('系統資料庫_勿刪');
+  var dataStr = "{}";
+  if (dbSheet) {
+    dataStr = dbSheet.getRange("A1").getValue() || "{}";
+  }
+  return ContentService.createTextOutput(dataStr).setMimeType(ContentService.MimeType.JSON);
 }
 
 function doPost(e) {
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-  var params = JSON.parse(e.postData.contents);
+  try {
+    var payload = JSON.parse(e.postData.contents);
+    var data = payload.data || payload;
+    if (data) {
+      saveDatabase(data);
+      updateReadableSheets(data);
+    }
+    return ContentService.createTextOutput(JSON.stringify({status: 'success'})).setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({error: err.toString()})).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+function saveDatabase(data) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName('系統資料庫_勿刪');
+  if (!sheet) {
+    sheet = ss.insertSheet('系統資料庫_勿刪');
+    sheet.hideSheet();
+  }
+  sheet.getRange('A1').setValue(JSON.stringify(data));
+}
+
+function updateReadableSheets(data) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!data.classes) return;
   
-  sheet.clear();
-  sheet.appendRow(['最後同步時間', new Date()]);
-  sheet.appendRow([JSON.stringify(params.data)]);
-  
-  return ContentService.createTextOutput(JSON.stringify({status: 'success'}))
-    .setMimeType(ContentService.MimeType.JSON);
+  data.classes.forEach(function(cls) {
+    var sheet = ss.getSheetByName(cls.name);
+    if (!sheet) sheet = ss.insertSheet(cls.name);
+    sheet.clear();
+    
+    var headers = ['日期', '座號', '姓名', '類別', '項目', '分數', '備註'];
+    var rows = [headers];
+    
+    var classRecords = data.records.filter(function(r) { return r.classId === cls.id; });
+    classRecords.forEach(function(r) {
+      var student = data.students.find(function(s) { return s.id === r.studentId; }) || {};
+      var typeName = r.type === 'positive' ? '獎勵' : '懲處';
+      
+      // 處理日期格式
+      var dateStr = "";
+      if (r.timestamp) {
+        var d = new Date(r.timestamp);
+        dateStr = d.getFullYear() + '/' + (d.getMonth()+1) + '/' + d.getDate();
+      } else if (r.date) {
+        dateStr = r.date;
+      }
+
+      var score = r.score !== undefined ? r.score : (r.points !== undefined ? r.points : 0);
+      
+      rows.push([dateStr, student.seatNo || '', student.name || '', typeName, r.item || '', score, r.note || '']);
+    });
+    
+    if (rows.length > 1) {
+      sheet.getRange(1, 1, rows.length, headers.length).setValues(rows);
+    }
+  });
 }`}
                       </pre>
                       <button 
                         onClick={() => {
-                          const code = `function doGet(e) {\n  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();\n  var dataStr = sheet.getRange("A2").getValue();\n  return ContentService.createTextOutput(dataStr || "{}").setMimeType(ContentService.MimeType.JSON);\n}\n\nfunction doPost(e) {\n  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();\n  var params = JSON.parse(e.postData.contents);\n  sheet.clear();\n  sheet.appendRow(['最後同步時間', new Date()]);\n  sheet.appendRow([JSON.stringify(params.data)]);\n  return ContentService.createTextOutput(JSON.stringify({status: 'success'})).setMimeType(ContentService.MimeType.JSON);\n}`;
+                          const code = `function doGet(e) {\n  var ss = SpreadsheetApp.getActiveSpreadsheet();\n  var dbSheet = ss.getSheetByName('系統資料庫_勿刪');\n  var dataStr = "{}";\n  if (dbSheet) {\n    dataStr = dbSheet.getRange("A1").getValue() || "{}";\n  }\n  return ContentService.createTextOutput(dataStr).setMimeType(ContentService.MimeType.JSON);\n}\n\nfunction doPost(e) {\n  try {\n    var payload = JSON.parse(e.postData.contents);\n    var data = payload.data || payload;\n    if (data) {\n      saveDatabase(data);\n      updateReadableSheets(data);\n    }\n    return ContentService.createTextOutput(JSON.stringify({status: 'success'})).setMimeType(ContentService.MimeType.JSON);\n  } catch (err) {\n    return ContentService.createTextOutput(JSON.stringify({error: err.toString()})).setMimeType(ContentService.MimeType.JSON);\n  }\n}\n\nfunction saveDatabase(data) {\n  var ss = SpreadsheetApp.getActiveSpreadsheet();\n  var sheet = ss.getSheetByName('系統資料庫_勿刪');\n  if (!sheet) {\n    sheet = ss.insertSheet('系統資料庫_勿刪');\n    sheet.hideSheet();\n  }\n  sheet.getRange('A1').setValue(JSON.stringify(data));\n}\n\nfunction updateReadableSheets(data) {\n  var ss = SpreadsheetApp.getActiveSpreadsheet();\n  if (!data.classes) return;\n  \n  data.classes.forEach(function(cls) {\n    var sheet = ss.getSheetByName(cls.name);\n    if (!sheet) sheet = ss.insertSheet(cls.name);\n    sheet.clear();\n    \n    var headers = ['日期', '座號', '姓名', '類別', '項目', '分數', '備註'];\n    var rows = [headers];\n    \n    var classRecords = data.records.filter(function(r) { return r.classId === cls.id; });\n    classRecords.forEach(function(r) {\n      var student = data.students.find(function(s) { return s.id === r.studentId; }) || {};\n      var typeName = r.type === 'positive' ? '獎勵' : '懲處';\n      \n      var dateStr = "";\n      if (r.timestamp) {\n        var d = new Date(r.timestamp);\n        dateStr = d.getFullYear() + '/' + (d.getMonth()+1) + '/' + d.getDate();\n      } else if (r.date) {\n        dateStr = r.date;\n      }\n\n      var score = r.score !== undefined ? r.score : (r.points !== undefined ? r.points : 0);\n      \n      rows.push([dateStr, student.seatNo || '', student.name || '', typeName, r.item || '', score, r.note || '']);\n    });\n    \n    if (rows.length > 1) {\n      sheet.getRange(1, 1, rows.length, headers.length).setValues(rows);\n    }\n  });\n}`;
                           navigator.clipboard.writeText(code).then(() => showNotify("程式碼已複製！"));
                         }}
                         className="absolute top-2 right-2 px-3 py-1.5 bg-white/20 hover:bg-white/30 text-white rounded-lg text-xs font-bold transition-colors opacity-0 group-hover:opacity-100"
                       >複製程式碼</button>
                     </div>
 
-                    <p className="font-black text-slate-900">3. 發佈部署 (必看⚠️)</p>
-                    <ul className="list-disc pl-5 space-y-1">
-                      <li>若您<strong className="text-red-600">曾經部署過</strong>，請點「部署」{'>'}「管理部署作業」，點擊鉛筆圖示，在「版本」選擇<strong className="text-red-600">「建立新版本」</strong>後儲存。</li>
-                      <li>若是<strong className="text-slate-900">首次部署</strong>：點「新增部署作業」{'>'}「網頁應用程式」{'>'} 權限設為「所有人」，複製網址貼入上方。</li>
-                    </ul>
+                    <p className="font-black text-slate-900 text-red-600">3. 重要！必須「建立新版本」</p>
+                    <p>在 GAS 編輯器點擊右上角的「部署」 {'>'} 「管理部署作業」，點選鉛筆圖示，在「版本」選擇<strong>「建立新版本」</strong>後點擊部署，這樣新程式碼才會生效！</p>
                   </div>
                 )}
               </div>
@@ -818,7 +864,7 @@ function doPost(e) {
       </Modal>
 
       <Modal isOpen={modalOpen === 'score'} onClose={() => setModalOpen(null)} title={multiSelect.length === 1 ? appData.students.find(s=>s.id===multiSelect[0])?.name : `批次給分 (${multiSelect.length}人)`}>
-        <ScoreModal onSave={(type, item, pts, note) => handleScore(multiSelect, type, pts, note)} />
+        <ScoreModal onSave={(type, item, pts, note) => handleScore(multiSelect, type, item, pts, note)} />
       </Modal>
     </div>
   );
