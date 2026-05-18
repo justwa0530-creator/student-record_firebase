@@ -198,7 +198,6 @@ export default function App() {
     }
   };
 
-  // --- 評分動作 (已修正加入 item 項目) ---
   const handleScore = async (studentIds, type, item, amount, note = "") => {
     const timestamp = Date.now();
     const scoreDelta = type === 'positive' ? amount : -amount;
@@ -305,7 +304,6 @@ export default function App() {
 
       if (cloudData && (cloudData.classes || cloudData.students)) {
         
-        // --- 容錯處理：相容舊版資料 ---
         const normalizedRecords = (cloudData.records || []).map(r => ({
           ...r,
           timestamp: r.timestamp || (r.date ? new Date(r.date).getTime() : Date.now()),
@@ -618,15 +616,16 @@ export default function App() {
                              <span className={`text-xs font-black px-2 py-1 rounded-lg ${multiSelect.includes(stu.id) ? 'bg-indigo-200 text-indigo-800' : 'bg-slate-100 text-slate-500'}`}>{stu.seatNo || '-'}</span>
                              {isMultiMode && <div className={`w-6 h-6 rounded-full flex items-center justify-center border-2 ${multiSelect.includes(stu.id) ? 'bg-indigo-600 border-indigo-600 text-white' : 'border-slate-200'}`}>{multiSelect.includes(stu.id) && <Check size={14} />}</div>}
                            </div>
-                           <div className="text-center w-full">
-                             <span className={`text-4xl font-black ${stu.totalPoints >= 0 ? 'text-green-500' : 'text-red-500'}`}>{stu.totalPoints}</span>
+                           
+                           {/* 改為強調姓名 */}
+                           <div className="flex-1 flex items-center justify-center py-2">
+                             <span className="font-black text-slate-800 text-center truncate w-full text-2xl">{stu.name}</span>
                            </div>
-                           <div className="font-black text-slate-800 text-center truncate w-full text-lg mt-1">{stu.name}</div>
                            
                            {/* 在卡片下方簡單顯示優缺點提示 */}
                            <div className="flex gap-1.5 w-full mt-2">
-                             <div className="flex-1 bg-green-50 text-green-700 text-[10px] font-bold py-1 rounded-lg text-center">+{stu.positivePoints}</div>
-                             <div className="flex-1 bg-red-50 text-red-700 text-[10px] font-bold py-1 rounded-lg text-center">-{Math.abs(stu.negativePoints)}</div>
+                             <div className="flex-1 bg-green-50 text-green-700 text-[10px] font-bold py-1.5 rounded-lg text-center">優 {stu.positivePoints}</div>
+                             <div className="flex-1 bg-red-50 text-red-700 text-[10px] font-bold py-1.5 rounded-lg text-center">缺 {Math.abs(stu.negativePoints)}</div>
                            </div>
                          </div>
                        ))}
@@ -683,9 +682,33 @@ export default function App() {
         {/* ---------------- 系統設定 ---------------- */}
         {activeTab === 'settings' && (
           <div className="max-w-2xl space-y-6">
+            
+            {/* 帳號管理置頂：強調雲端自動同步 */}
             <div className="bg-white rounded-[2.5rem] border border-slate-100 p-8 shadow-sm">
-              <h3 className="font-black text-xl mb-6 flex items-center gap-2"><Database size={24} className="text-green-600"/> GAS 雲端雙向同步</h3>
-              <p className="text-sm text-slate-500 mb-4 font-medium">系統已完美支援與舊版試算表結構相容，並自動將舊資料轉換升級：</p>
+               <h3 className="font-black text-xl mb-2 flex items-center gap-2 text-slate-800">
+                 <User size={24} className="text-indigo-600" /> 帳號管理
+               </h3>
+               <p className="text-sm text-slate-500 mb-6 font-medium">登入 Google 帳號後，您的資料會自動且即時地同步至 Firebase 雲端資料庫，確保資料安全不遺失。</p>
+               
+               <div className="flex items-center gap-4 mb-6 p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                 <div className="w-12 h-12 rounded-full bg-white border border-slate-200 flex items-center justify-center overflow-hidden flex-shrink-0">
+                    {user?.photoURL && user.uid !== 'local-guest' ? <img src={user.photoURL} alt="avatar" /> : <User className="text-slate-400" size={24} />}
+                 </div>
+                 <div className="overflow-hidden">
+                   <p className="text-base font-bold truncate text-slate-800">{getUserDisplayName(user)}</p>
+                   <p className="text-xs text-slate-500 truncate">{user.uid === 'local-guest' ? '目前為訪客模式 (資料僅存本機)' : user.email}</p>
+                 </div>
+               </div>
+
+               <button onClick={handleLogout} className="w-full py-4 bg-red-50 text-red-600 rounded-2xl font-bold hover:bg-red-100 flex items-center justify-center gap-2 transition-colors">
+                 <LogOut size={20} /> {user.uid === 'local-guest' ? '登出訪客模式' : '登出系統'}
+               </button>
+            </div>
+
+            {/* GAS 作為第二備案的區塊 */}
+            <div className="bg-white rounded-[2.5rem] border border-slate-100 p-8 shadow-sm">
+              <h3 className="font-black text-xl mb-2 flex items-center gap-2"><Database size={24} className="text-green-600"/> GAS 備用同步方案</h3>
+              <p className="text-sm text-slate-500 mb-4 font-medium">這是同步資料的<strong className="text-amber-600">備案第二方案（非必填）</strong>。若您希望額外將資料備份到 Google Sheets 試算表以方便瀏覽，才需要進行設定：</p>
               
               <div className="flex flex-col sm:flex-row gap-2 mb-4">
                 <input 
@@ -839,12 +862,6 @@ function updateReadableSheets(data) {
               </div>
             </div>
 
-            <div className="bg-white rounded-[2.5rem] border border-slate-100 p-8 shadow-sm">
-               <h3 className="font-black text-xl mb-6 text-slate-800">帳號管理</h3>
-               <button onClick={handleLogout} className="w-full py-4 bg-red-50 text-red-600 rounded-2xl font-bold hover:bg-red-100 flex items-center justify-center gap-2">
-                 <LogOut size={20} /> 登出系統
-               </button>
-            </div>
           </div>
         )}
       </main>
