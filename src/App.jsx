@@ -1,19 +1,20 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { 
   Plus, Minus, Users, Settings, Save, RefreshCw, Trash2, 
-  ChevronRight, LogOut, Cloud, CheckCircle2, User, ShieldCheck,
+  ChevronRight, ChevronLeft, MoreHorizontal, LogOut, Cloud, 
+  CloudOff, CheckCircle2, AlertCircle, User, LogIn, ShieldCheck,
   Check, X, ClipboardList, UserPlus, GraduationCap, UploadCloud,
   FileSpreadsheet, UserCog, FileDown, ThumbsUp, ThumbsDown, Database,
-  CheckSquare, LayoutDashboard, History, LayoutGrid, List
+  LayoutGrid, List, FileText, CheckSquare
 } from 'lucide-react';
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { 
-  getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, 
-  signOut, signInAnonymously, signInWithCustomToken 
+  getAuth, onAuthStateChanged, signInAnonymously, signInWithPopup, 
+  signInWithRedirect, getRedirectResult, GoogleAuthProvider, signOut,
+  signInWithCustomToken 
 } from 'firebase/auth';
 import { 
-  getFirestore, doc, setDoc, getDoc, collection, onSnapshot, 
-  deleteDoc, addDoc, writeBatch
+  getFirestore, doc, setDoc, getDoc, serverTimestamp, onSnapshot
 } from 'firebase/firestore';
 import * as XLSX from 'xlsx';
 
@@ -35,830 +36,798 @@ const userFirebaseConfig = {
 };
 
 const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : userFirebaseConfig;
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'moral-pro-system';
 
-// --- 工具函數 ---
+// --- 3. 資料修復與工具函數 ---
 const safeParse = (str, fallback = {}) => {
   if (!str) return fallback;
   try { return JSON.parse(str) || fallback; } catch { return fallback; }
 };
 
+const repairData = (data) => {
+  const defaultData = { classes: [], students: [], records: [], settings: { schoolName: "" }, lastSync: null };
+  if (!data || typeof data !== 'object') return defaultData;
+  const repaired = { ...defaultData, ...data };
+  repaired.classes = repaired.classes || [];
+  repaired.students = repaired.students || [];
+  repaired.records = repaired.records || [];
+  return repaired;
+};
+
+// 取得使用者顯示名稱
 const getUserDisplayName = (user) => {
   if (!user) return '未登入';
-  if (user.uid === 'local-guest') return '訪客 (本機模式)';
+  if (user.isAnonymous) return '訪客 (未綁定 Google)';
   if (user.displayName?.trim()) return user.displayName;
   if (user.providerData?.length > 0 && user.providerData[0].displayName?.trim()) return user.providerData[0].displayName;
   if (user.email) return user.email;
+  if (user.providerData?.length > 0 && user.providerData[0].email) return user.providerData[0].email;
   return `特殊帳號-${user.uid.slice(0, 6)}`;
 };
 
-// --- 主程式組件 ---
+// --- 4. 主要元件 (App) ---
 export default function App() {
+  // 核心驗證狀態
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState('classes');
+  
+  // 應用程式資料狀態
+  const [appData, setAppData] = useState({ classes: [], students: [], records: [], settings: { schoolName: "" }, lastSync: null });
+  const [activeTab, setActiveTab] = useState('dashboard');
   const [selectedClassId, setSelectedClassId] = useState(null);
-  
-  // App 資料狀態
-  const [appData, setAppData] = useState({ classes: [], students: [], records: [], settings: { gasUrl: '' } });
-  const [syncStatus, setSyncStatus] = useState('idle');
-  
-  // UI 狀態
-  const [modalOpen, setModalOpen] = useState(null);
-  const [multiSelect, setMultiSelect] = useState([]);
-  const [isMultiMode, setIsMultiMode] = useState(false);
-  const [viewMode, setViewMode] = useState('grid');
-  const [notification, setNotification] = useState(null);
-  const [showGasTutorial, setShowGasTutorial] = useState(false);
+  const [syncStatus, setSyncStatus] = useState('idle'); // idle, syncing, success, error
+  const [apiUrl, setApiUrl] = useState(''); // GAS URL
 
-  // --- 1. 初始化讀取本地快取 ---
+  // UI 互動狀態
+  const [viewMode, setViewMode] = useState('grid'); // 'grid' | 'table'
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [selectedStudents, setSelectedStudents] = useState([]);
+  const [modalOpen, setModalOpen] = useState(null); // 'score', 'importClass', 'editStudents', 'profile'
+  const [targetStudentId, setTargetStudentId] = useState(null); // 個人檔案目標學生
+  const [notification, setNotification] = useState(null);
+
+  // ----------------------------------------------------------------
+  // A. 驗證與資料初始化 (Auth Lifecycle)
+  // ----------------------------------------------------------------
   useEffect(() => {
     const cached = localStorage.getItem('school_moral_v2');
     if (cached) {
-      const parsed = safeParse(cached);
-      setAppData({
-        classes: parsed.classes || [],
-        students: parsed.students || [],
-        records: parsed.records || [],
-        settings: parsed.settings || { gasUrl: '' }
-      });
+      try { setAppData(repairData(safeParse(cached))); } catch (e) { console.error(e); }
     }
-  }, []);
+    const savedUrl = localStorage.getItem('gas_api_url');
+    if (savedUrl) setApiUrl(savedUrl);
 
-  // --- 2. 認證與 Firebase 監聽 ---
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (u) => {
+    // 背景檢查轉址登入結果
+    (async () => {
+      try {
+        const result = await getRedirectResult(auth);
+        if (result?.user) await result.user.reload();
+      } catch (error) {
+        console.error("轉址登入發生錯誤:", error);
+      }
+    })();
+
+    const unsubscribe = onAuthStateChanged(auth, async (u) => {
+      setAuthLoading(false);
       if (u) {
         setUser(u);
+        if (!u.isAnonymous) fetchCloudData(u.uid);
       } else {
-        setUser(prev => prev?.uid === 'local-guest' ? prev : null);
+        setUser(null);
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          try { await signInWithCustomToken(auth, __initial_auth_token); } catch(e) {}
+        }
       }
-      setAuthLoading(false);
     });
     return () => unsubscribe();
   }, []);
 
-  useEffect(() => {
-    if (!user || user.uid === 'local-guest') return;
+  // ----------------------------------------------------------------
+  // B. 雲端同步邏輯
+  // ----------------------------------------------------------------
+  const fetchCloudData = async (uid) => {
+    if (!uid) return;
+    setSyncStatus('syncing');
+    try {
+      const docRef = doc(db, 'artifacts', appId, 'users', uid, 'data', 'main');
+      const snap = await getDoc(docRef);
+      if (snap.exists()) {
+        const cloudData = repairData(snap.data());
+        setAppData(cloudData);
+        localStorage.setItem('school_moral_v2', JSON.stringify(cloudData));
+        setSyncStatus('success');
+      } else {
+        setSyncStatus('idle');
+      }
+    } catch (err) { setSyncStatus('error'); }
+  };
 
-    const unsubClasses = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, 'classes'), (s) => {
-      setAppData(prev => ({ ...prev, classes: s.docs.map(d => ({ id: d.id, ...d.data() })) }));
-    });
-    const unsubStudents = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, 'students'), (s) => {
-      setAppData(prev => ({ ...prev, students: s.docs.map(d => ({ id: d.id, ...d.data() })) }));
-    });
-    const unsubRecords = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, 'records'), (s) => {
-      const recs = s.docs.map(d => ({ id: d.id, ...d.data() }));
-      setAppData(prev => ({ ...prev, records: recs.sort((a, b) => b.timestamp - a.timestamp) }));
-    });
-    const unsubSettings = onSnapshot(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'config'), (d) => {
-      if (d.exists()) setAppData(prev => ({ ...prev, settings: d.data() }));
+  const saveState = useCallback(async (newData) => {
+    const dataToSave = repairData(newData);
+    setAppData(dataToSave);
+    localStorage.setItem('school_moral_v2', JSON.stringify(dataToSave));
+    
+    let hasError = false;
+    setSyncStatus('syncing');
+
+    // 1. Firebase Sync
+    if (user && !user.isAnonymous) {
+      try {
+        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'data', 'main');
+        await setDoc(docRef, { ...dataToSave, lastSync: serverTimestamp() });
+      } catch (err) {
+        console.error("Firebase Sync Error", err);
+        hasError = true;
+      }
+    }
+
+    // 2. GAS Sync
+    if (apiUrl) {
+      try {
+        await fetch(apiUrl, {
+          method: 'POST',
+          body: JSON.stringify({ data: dataToSave }),
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        });
+      } catch (err) {
+        console.error("GAS Sync Error", err);
+        hasError = true;
+      }
+    }
+
+    if (hasError) {
+      setSyncStatus('error');
+    } else if ((user && !user.isAnonymous) || apiUrl) {
       setSyncStatus('success');
-    });
+      setTimeout(() => setSyncStatus('idle'), 2000);
+    } else {
+      setSyncStatus('idle');
+    }
+  }, [user, apiUrl]);
 
-    return () => { unsubClasses(); unsubStudents(); unsubRecords(); unsubSettings(); };
-  }, [user]);
+  const fetchFromGasCloud = async () => {
+    if (!apiUrl) return;
+    if (!window.confirm("確定要從 Google Sheet 下載舊有資料嗎？這將覆蓋手機目前的資料。")) return;
+    setSyncStatus('syncing');
+    try {
+      const res = await fetch(apiUrl, { redirect: 'follow' });
+      if (!res.ok) throw new Error('Network error');
+      const cloudData = await res.json();
+      if (cloudData && cloudData.classes) {
+        const repaired = repairData(cloudData);
+        saveState(repaired);
+        showNotify('成功從 Google Sheet 下載最新資料！');
+      }
+    } catch (err) {
+      setSyncStatus('error');
+      showNotify('Google Sheet 下載失敗。請確定腳本已支援 GET 讀取功能。');
+    }
+  };
 
   const showNotify = (msg) => {
     setNotification(msg);
     setTimeout(() => setNotification(null), 3000);
   };
 
-  // --- 3. 動作處理 (樂觀更新架構) ---
-  const handleGuestLogin = () => {
-    setUser({ uid: 'local-guest', isAnonymous: true, displayName: '訪客' });
+  // ----------------------------------------------------------------
+  // C. 驗證動作
+  // ----------------------------------------------------------------
+  const handleGoogleLogin = async () => {
+    setAuthLoading(true);
+    const provider = new GoogleAuthProvider();
+    provider.setCustomParameters({ prompt: 'select_account' });
+    try {
+      const isMobile = /Android|iPhone|iPad/i.test(navigator.userAgent);
+      if (!isMobile) {
+        const result = await signInWithPopup(auth, provider);
+        await result.user.reload();
+      } else {
+        await signInWithRedirect(auth, provider);
+      }
+    } catch (error) {
+      if (error.code === 'auth/popup-blocked') {
+        if (window.confirm("彈出視窗被封鎖，是否切換至頁面跳轉登入？")) signInWithRedirect(auth, provider);
+      }
+    } finally { setAuthLoading(false); }
   };
 
-  const handleGoogleLogin = async () => {
-    try { 
-      const provider = new GoogleAuthProvider();
-      provider.setCustomParameters({ prompt: 'select_account' }); 
-      await signInWithPopup(auth, provider); 
-    } catch (e) { console.error(e); }
+  const handleGuestLogin = async () => {
+    setAuthLoading(true);
+    try { await signInAnonymously(auth); } catch (e) { alert("訪客登入失敗"); }
+    finally { setAuthLoading(false); }
   };
 
   const handleLogout = async () => {
-    if (window.confirm("確定登出系統？(未綁定的訪客資料會保留在瀏覽器中)")) {
-      if (user?.uid !== 'local-guest') {
-        await signOut(auth);
-      }
+    if (window.confirm("確定登出？未同步資料將遺失。")) {
+      await signOut(auth);
+      setAppData({ classes: [], students: [], records: [], settings: { schoolName: "" }, lastSync: null });
+      localStorage.removeItem('school_moral_v2');
       setUser(null);
     }
   };
 
-  const handleAddClass = async (classData, students) => {
-    const newClassId = Date.now().toString();
-    const newClass = { id: newClassId, name: classData.name || "未命名", createdAt: Date.now() };
-    
-    const newStudents = (students || []).map(s => ({
-      id: `std_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
-      classId: newClassId, name: s.name || "無名", seatNo: s.seatNo || "", totalScore: 0, createdAt: Date.now()
-    }));
-
-    setAppData(prev => {
-      const nextData = { ...prev, classes: [...prev.classes, newClass], students: [...prev.students, ...newStudents] };
-      localStorage.setItem('school_moral_v2', JSON.stringify(nextData));
-      return nextData;
-    });
-    setModalOpen(null);
-    showNotify("班級建立成功！");
-
-    if (user && user.uid !== 'local-guest') {
-      try {
-        const batch = writeBatch(db);
-        batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'classes', newClassId), newClass);
-        newStudents.forEach(s => batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'students', s.id), s));
-        await batch.commit();
-      } catch (e) { console.error("Firebase sync failed", e); }
-    }
-  };
-
-  const handleDeleteClass = async (id) => {
-    if (!window.confirm("確定刪除班級？此動作無法復原。")) return;
-    
-    setAppData(prev => {
-      const nextData = {
-        ...prev,
-        classes: prev.classes.filter(c => c.id !== id),
-        students: prev.students.filter(s => s.classId !== id),
-        records: prev.records.filter(r => r.classId !== id)
-      };
-      localStorage.setItem('school_moral_v2', JSON.stringify(nextData));
-      return nextData;
-    });
-    if (selectedClassId === id) setSelectedClassId(null);
-    showNotify("班級已刪除");
-
-    if (user && user.uid !== 'local-guest') {
-      try { await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'classes', id)); } 
-      catch (e) { console.error(e); }
-    }
-  };
-
-  const handleScore = async (studentIds, type, item, amount, note = "") => {
-    const timestamp = Date.now();
-    const scoreDelta = type === 'positive' ? amount : -amount;
-    
-    const newRecords = studentIds.map(sid => {
-      const st = appData.students.find(s => s.id === sid);
-      return {
-        id: `rec_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-        studentId: sid, studentName: st?.name || '未知', classId: st?.classId,
-        type, item, score: scoreDelta, note, timestamp
-      };
-    });
-
-    setAppData(prev => {
-      const nextData = {
-        ...prev,
-        records: [...newRecords, ...prev.records].sort((a, b) => b.timestamp - a.timestamp),
-        students: prev.students.map(s => studentIds.includes(s.id) ? { ...s, totalScore: (s.totalScore || 0) + scoreDelta } : s)
-      };
-      localStorage.setItem('school_moral_v2', JSON.stringify(nextData));
-      return nextData;
-    });
-
-    setModalOpen(null);
-    if (isMultiMode) { setMultiSelect([]); setIsMultiMode(false); }
-    showNotify(studentIds.length > 1 ? `已批次新增 ${studentIds.length} 筆紀錄` : "已新增紀錄");
-
-    if (user && user.uid !== 'local-guest') {
-      try {
-        const batch = writeBatch(db);
-        newRecords.forEach(r => batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'records', r.id), r));
-        studentIds.forEach(sid => {
-          const st = appData.students.find(s => s.id === sid);
-          batch.update(doc(db, 'artifacts', appId, 'users', user.uid, 'students', sid), { 
-            totalScore: (st?.totalScore || 0) + scoreDelta 
-          });
-        });
-        await batch.commit();
-      } catch (e) { console.error("Firebase update failed", e); }
-    }
-  };
-
-  const handleAddStudent = async (classId, seatNo, name) => {
-    const newStudent = { id: `std_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`, classId, seatNo, name, totalScore: 0, createdAt: Date.now() };
-    
-    setAppData(prev => {
-      const nextData = { ...prev, students: [...prev.students, newStudent] };
-      localStorage.setItem('school_moral_v2', JSON.stringify(nextData));
-      return nextData;
-    });
-
-    if (user && user.uid !== 'local-guest') {
-      try { await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'students', newStudent.id), newStudent); } catch(e){}
-    }
-  };
-
-  const handleDeleteStudent = async (id) => {
-    if (!window.confirm("確定移除該名學生？")) return;
-    setAppData(prev => {
-       const nextData = { ...prev, students: prev.students.filter(s => s.id !== id) };
-       localStorage.setItem('school_moral_v2', JSON.stringify(nextData));
-       return nextData;
-    });
-
-    if (user && user.uid !== 'local-guest') {
-      try { await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'students', id)); } catch(e){}
-    }
-  };
-
-  const handleGasManualSync = async () => {
-    if (!appData.settings.gasUrl) {
-      showNotify("請先填寫並儲存 GAS 網址！");
-      return;
-    }
-    setSyncStatus('syncing');
-    try {
-      await fetch(appData.settings.gasUrl, {
-        method: 'POST',
-        body: JSON.stringify({ data: appData }),
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        redirect: "follow"
-      });
-      showNotify("✅ 手動備份指令已發送！");
-      setSyncStatus('success');
-      setTimeout(() => setSyncStatus('idle'), 2000);
-    } catch (err) {
-      console.error(err);
-      showNotify("❌ 備份失敗，請檢查網址或權限設定");
-      setSyncStatus('error');
-    }
-  };
-
-  const handleGasDownload = async () => {
-    if (!appData.settings.gasUrl) {
-      showNotify("請先填寫 GAS 網址！");
-      return;
-    }
-    if (!window.confirm("這將會覆蓋掉目前的本地資料，確定要從雲端下載嗎？")) return;
-
-    setSyncStatus('syncing');
-    try {
-      const response = await fetch(appData.settings.gasUrl, { redirect: "follow" });
-      const cloudData = await response.json();
-
-      if (cloudData && (cloudData.classes || cloudData.students)) {
-        
-        const normalizedRecords = (cloudData.records || []).map(r => ({
-          ...r,
-          timestamp: r.timestamp || (r.date ? new Date(r.date).getTime() : Date.now()),
-          score: r.score !== undefined ? r.score : (r.points !== undefined ? r.points : 0),
-          item: r.item || '未分類',
-          note: r.note || ''
-        }));
-        
-        cloudData.records = normalizedRecords;
-        
-        setAppData(prev => {
-          const nextData = { ...cloudData, settings: prev.settings };
-          localStorage.setItem('school_moral_v2', JSON.stringify(nextData));
-          return nextData;
-        });
-        
-        if (user && user.uid !== 'local-guest') {
-          const batch = writeBatch(db);
-          (cloudData.classes || []).forEach(c => batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'classes', c.id), c));
-          (cloudData.students || []).forEach(s => batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'students', s.id), s));
-          normalizedRecords.forEach(r => batch.set(doc(db, 'artifacts', appId, 'users', user.uid, 'records', r.id), r));
-          await batch.commit();
-        }
-        
-        showNotify("✅ 雲端資料下載成功！");
-        setSyncStatus('success');
-      } else {
-        showNotify("⚠️ 雲端目前沒有有效的資料");
-        setSyncStatus('idle');
-      }
-    } catch (err) {
-      console.error(err);
-      showNotify("❌ 下載失敗，請確保已發佈新版 GAS 程式碼");
-      setSyncStatus('error');
-    } finally {
-      setTimeout(() => setSyncStatus('idle'), 2000);
-    }
-  };
-
-  const handleExport = () => {
-    const csvContent = "\uFEFF" + "日期,學生,班級,類型,項目,分數,備註\n" +
-      appData.records.filter(r => r.classId === selectedClassId).map(r => {
-        const date = new Date(r.timestamp).toLocaleDateString();
-        const cls = appData.classes.find(c => c.id === r.classId)?.name || '未知';
-        return `${date},${r.studentName},${cls},${r.type === 'positive' ? '獎勵' : '懲處'},${r.item || ''},${r.score},${r.note}`;
-      }).join("\n");
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(new Blob([csvContent], { type: 'text/csv;charset=utf-8;' }));
-    link.download = `品德紀錄_${new Date().toLocaleDateString()}.csv`;
-    link.click();
-  };
-
-  // 結算當前選取班級的資料
+  // ----------------------------------------------------------------
+  // D. 業務邏輯 (學生與評分管理)
+  // ----------------------------------------------------------------
+  
+  // 計算目前選取班級的學生清單與分數
   const activeClassData = useMemo(() => {
     const cls = appData.classes.find(c => c.id === selectedClassId);
     if (!cls) return null;
+
     const classStudents = appData.students.filter(s => s.classId === cls.id);
     const studentsWithPoints = classStudents.map(s => {
       const sRecs = appData.records.filter(r => r.studentId === s.id);
       return {
         ...s,
-        totalPoints: sRecs.reduce((sum, r) => sum + (r.score || 0), 0),
-        positivePoints: sRecs.filter(r => r.type === 'positive').reduce((sum, r) => sum + (r.score || 0), 0),
-        negativePoints: sRecs.filter(r => r.type === 'negative').reduce((sum, r) => sum + (r.score || 0), 0)
+        totalPoints: sRecs.reduce((sum, r) => sum + r.points, 0),
+        positivePoints: sRecs.filter(r => r.points > 0).reduce((sum, r) => sum + r.points, 0),
+        negativePoints: sRecs.filter(r => r.points < 0).reduce((sum, r) => sum + r.points, 0)
       };
     }).sort((a, b) => (parseInt(a.seatNo) || 0) - (parseInt(b.seatNo) || 0));
+
     return { ...cls, students: studentsWithPoints };
   }, [appData, selectedClassId]);
 
-  // --- 畫面渲染 ---
-  if (!user && !authLoading) {
+  const targetStudentProfile = useMemo(() => {
+    if (!targetStudentId) return null;
+    const student = appData.students.find(s => s.id === targetStudentId);
+    if (!student) return null;
+    // 依時間/ID降序排序，最新紀錄在最上面
+    const records = appData.records.filter(r => r.studentId === targetStudentId).sort((a, b) => b.id.localeCompare(a.id));
+    return { ...student, records };
+  }, [appData, targetStudentId]);
+
+  const toggleStudentSelection = (id) => {
+    setSelectedStudents(prev => 
+      prev.includes(id) ? prev.filter(sid => sid !== id) : [...prev, id]
+    );
+  };
+
+  const selectAllStudents = () => {
+    if (activeClassData) {
+      setSelectedStudents(activeClassData.students.map(s => s.id));
+    }
+  };
+
+  const handleSaveRecords = (type, item, points, note) => {
+    const targetIds = isSelectionMode ? selectedStudents : [selectedStudents[0]];
+    if (targetIds.length === 0) return;
+
+    const newRecords = targetIds.map(stId => {
+      const st = appData.students.find(s => s.id === stId);
+      return {
+        id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
+        classId: selectedClassId,
+        studentId: stId,
+        studentName: st.name,
+        studentNo: st.seatNo || '',
+        date: new Date().toISOString().split('T')[0],
+        type,
+        item,
+        points: type === 'positive' ? Math.abs(points) : -Math.abs(points),
+        note: note || ''
+      };
+    });
+
+    saveState({ ...appData, records: [...appData.records, ...newRecords] });
+    setModalOpen(null);
+    setIsSelectionMode(false);
+    setSelectedStudents([]);
+    showNotify(targetIds.length > 1 ? `已批次新增 ${targetIds.length} 筆紀錄` : `已新增紀錄`);
+  };
+
+  // 刪除單筆紀錄
+  const handleDeleteRecord = (recordId) => {
+    if (window.confirm("確定刪除這筆紀錄？分數將會自動扣回。")) {
+      const newRecords = appData.records.filter(r => r.id !== recordId);
+      saveState({ ...appData, records: newRecords });
+      showNotify("紀錄已刪除，分數已自動更新！");
+    }
+  };
+
+  const handleAddClass = (classData, students) => {
+    const newClass = { id: Date.now().toString(), name: classData.name };
+    const newStudents = students.map(s => ({
+      id: `std_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+      classId: newClass.id, 
+      seatNo: s.seatNo, 
+      name: s.name
+    }));
+    saveState({
+      ...appData, 
+      classes: [...appData.classes, newClass], 
+      students: [...appData.students, ...newStudents]
+    });
+    setSelectedClassId(newClass.id);
+    setActiveTab('dashboard');
+    showNotify(`已新增班級「${newClass.name}」`);
+  };
+
+  const handleUpdateStudents = (classId, updatedStudents) => {
+    const otherStudents = appData.students.filter(s => s.classId !== classId);
+    saveState({ ...appData, students: [...otherStudents, ...updatedStudents] });
+    showNotify('名單已更新！');
+  };
+
+  const handleDeleteClass = (classId) => {
+    if (window.confirm('警告：刪除班級將永久移除該班所有學生與紀錄。確定刪除？')) {
+      saveState({
+        ...appData,
+        classes: appData.classes.filter(c => c.id !== classId),
+        students: appData.students.filter(s => s.classId !== classId),
+        records: appData.records.filter(r => r.classId !== classId)
+      });
+      if (selectedClassId === classId) setSelectedClassId(null);
+      showNotify("班級已刪除");
+    }
+  };
+
+  const exportCSV = () => {
+    if (!activeClassData) return;
+    const csvRows = ['座號,姓名,優點,缺點,總計'];
+    activeClassData.students.forEach(s => {
+      csvRows.push(`${s.seatNo || ''},${s.name},${s.positivePoints},${s.negativePoints},${s.totalPoints}`);
+    });
+    const csvContent = '\uFEFF' + csvRows.join('\n'); // Add BOM for Excel
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([csvContent], { type: 'text/csv;charset=utf-8;' }));
+    a.download = `${activeClassData.name}_總表.csv`;
+    a.click();
+  };
+
+  // ----------------------------------------------------------------
+  // E. 渲染元件
+  // ----------------------------------------------------------------
+
+  if (authLoading) {
     return (
-      <div className="min-h-screen bg-[#F8FAFC] flex items-center justify-center p-6">
-        <div className="max-w-md w-full bg-white rounded-[3rem] shadow-2xl p-10 text-center border border-slate-100">
-          <div className="w-20 h-20 bg-indigo-600 rounded-[2rem] flex items-center justify-center mx-auto mb-8 shadow-lg shadow-indigo-200">
-            <ShieldCheck size={40} className="text-white" />
+      <div className="min-h-screen flex flex-col items-center justify-center bg-slate-50 gap-4">
+        <RefreshCw className="w-12 h-12 text-indigo-600 animate-spin" />
+        <p className="text-indigo-600 font-bold tracking-widest">SYSTEM LOADING...</p>
+      </div>
+    );
+  }
+
+  // 登入牆 (Auth Guard)
+  if (!user) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-slate-50 px-4">
+        <div className="bg-white p-10 rounded-[3rem] shadow-xl max-w-sm w-full text-center space-y-8 border border-slate-100">
+          <div className="flex justify-center">
+            <div className="w-20 h-20 bg-indigo-600 rounded-3xl flex items-center justify-center text-white shadow-lg shadow-indigo-200">
+              <ShieldCheck size={40} />
+            </div>
           </div>
-          <h1 className="text-3xl font-black text-slate-900 mb-2">品德紀錄 Pro</h1>
-          <p className="text-slate-500 font-medium mb-10">專業、高效、數據化的班級管理工具</p>
-          <div className="space-y-4">
-            <button onClick={handleGoogleLogin} className="w-full py-4 bg-indigo-600 text-white rounded-2xl flex items-center justify-center gap-3 font-bold transition-all hover:bg-indigo-700 shadow-lg shadow-indigo-100">
-              <Cloud size={20} /> 使用 Google 帳號登入
+          <div className="space-y-2">
+            <h1 className="text-3xl font-black text-slate-900 tracking-tight">品德雲端管理</h1>
+            <p className="text-slate-500 font-medium leading-relaxed">專業、快速、穩定的<br/>班級經營評分助手</p>
+          </div>
+          <div className="space-y-3">
+            <button 
+              onClick={handleGoogleLogin}
+              className="w-full py-4 bg-indigo-600 text-white rounded-2xl font-bold shadow-lg shadow-indigo-100 active:scale-95 transition-all flex justify-center items-center gap-3"
+            >
+              <Cloud className="w-5 h-5"/> Google 帳號登入
             </button>
-            <button onClick={handleGuestLogin} className="w-full py-4 bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 rounded-2xl flex items-center justify-center gap-3 font-bold transition-all">
-              <User size={20} /> 以訪客身分試用
+            <button 
+              onClick={handleGuestLogin}
+              className="w-full py-4 bg-white text-slate-700 border-2 border-slate-100 rounded-2xl font-bold active:scale-95 transition-all flex justify-center items-center gap-3 hover:bg-slate-50"
+            >
+              <User className="w-5 h-5"/> 先以訪客試用
             </button>
           </div>
+          <p className="text-xs text-slate-400">登入即代表同意資料同步至雲端伺服器</p>
         </div>
       </div>
     );
   }
 
-  if (authLoading) return (
-    <div className="min-h-screen flex items-center justify-center bg-slate-50">
-      <RefreshCw className="animate-spin text-indigo-600" size={40} />
-    </div>
-  );
-
   return (
-    <div className="min-h-screen bg-[#F8FAFC] text-slate-900 font-sans pb-24 lg:pb-0 lg:pl-24 select-none">
+    <div className="min-h-screen bg-slate-50 pb-28 lg:pb-0 lg:pl-64 flex flex-col select-none">
       
+      {/* 提示通知 */}
       {notification && (
-        <div className="fixed top-6 left-1/2 -translate-x-1/2 bg-slate-800 text-white px-6 py-3 rounded-full shadow-2xl flex items-center gap-2 z-[100] animate-in slide-in-from-top-4 text-sm font-bold">
+        <div className="fixed top-20 left-1/2 -translate-x-1/2 bg-slate-800 text-white px-6 py-3 rounded-full shadow-2xl flex items-center gap-2 z-[100] animate-in slide-in-from-top-4 text-sm font-bold">
           <CheckCircle2 className="w-5 h-5 text-green-400" /> {notification}
         </div>
       )}
 
-      {/* 導覽列 */}
-      <nav className="fixed bottom-0 left-0 right-0 lg:top-0 lg:bottom-0 lg:w-24 bg-white border-t lg:border-t-0 lg:border-r border-slate-100 z-50 flex lg:flex-col items-center justify-around lg:justify-center p-4 gap-8">
-        <div className="hidden lg:flex w-14 h-14 bg-indigo-600 rounded-2xl items-center justify-center text-white mb-auto shadow-lg shadow-indigo-100">
-          <GraduationCap size={28} />
-        </div>
-        <NavButton active={activeTab === 'classes'} onClick={() => setActiveTab('classes')} icon={<Users size={24}/>} label="班級" />
-        <NavButton active={activeTab === 'behavior'} onClick={() => setActiveTab('behavior')} icon={<ClipboardList size={24}/>} label="紀錄" />
-        <NavButton active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} icon={<Settings size={24}/>} label="設定" />
-        <button onClick={handleLogout} className="hidden lg:flex mt-auto p-4 text-slate-400 hover:text-red-500 transition-colors">
-          <LogOut size={24} />
-        </button>
-      </nav>
-
-      {/* 桌面版專屬：豐富左側邊欄擴充 */}
-      <aside className="fixed left-24 top-0 bottom-0 w-64 bg-white border-r border-slate-200 hidden 2xl:flex flex-col z-40">
-        <div className="p-8 border-b border-slate-100">
-          <h2 className="text-2xl font-black text-slate-800 tracking-tight">Moral Pro</h2>
-          <p className="text-sm font-bold text-indigo-500 mt-1">學生品德管理系統</p>
-        </div>
-        <div className="flex-1 p-6 space-y-2 overflow-y-auto">
-          {appData.classes.length === 0 ? (
-            <p className="text-sm font-bold text-slate-400 text-center mt-10">尚無建立班級</p>
-          ) : (
-            appData.classes.map(c => (
-              <button 
-                key={c.id} 
-                onClick={() => { setSelectedClassId(c.id); setActiveTab('behavior'); }}
-                className={`w-full text-left px-4 py-3 rounded-xl font-bold text-sm transition-all flex items-center justify-between ${selectedClassId === c.id && activeTab === 'behavior' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600 hover:bg-slate-50'}`}
-              >
-                {c.name}
-                <ChevronRight size={16} className={selectedClassId === c.id && activeTab === 'behavior' ? 'text-indigo-400' : 'text-slate-300'} />
-              </button>
-            ))
-          )}
+      {/* 側邊導覽 (Desktop) */}
+      <aside className="fixed left-0 top-0 bottom-0 w-64 bg-white border-r border-slate-200 hidden lg:flex flex-col p-6 z-50">
+        <div className="flex items-center gap-3 px-2 mb-10">
+          <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center text-white">
+            <ShieldCheck size={24} />
+          </div>
+          <span className="font-black text-xl">MoralPro</span>
         </div>
         
-        {/* 側邊欄下方：顯示帳號頭像與登出按鈕 */}
-        <div className="mt-auto border-t border-slate-100 pt-6 pb-6 px-6">
-          <div className="flex items-center justify-between group">
-            <div className="flex items-center gap-3 overflow-hidden">
-              <div className="w-10 h-10 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center overflow-hidden flex-shrink-0">
-                {user?.photoURL && user.uid !== 'local-guest' ? <img src={user.photoURL} alt="avatar" /> : <User className="text-slate-400" size={20} />}
-              </div>
-              <div className="overflow-hidden">
-                <p className="text-sm font-bold truncate text-slate-800">{getUserDisplayName(user)}</p>
-                <p className="text-[10px] text-slate-400 truncate">{user.uid === 'local-guest' ? '資料僅存本機' : user.email}</p>
-              </div>
-            </div>
-            <button onClick={handleLogout} className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition-colors" title="登出系統">
-              <LogOut size={20} />
+        <nav className="space-y-2 flex-1">
+          {[
+            { id: 'dashboard', icon: ClipboardList, label: '計分儀表板' },
+            { id: 'classes', icon: Users, label: '班級管理' },
+            { id: 'settings', icon: Settings, label: '系統設定' }
+          ].map(item => (
+            <button
+              key={item.id}
+              onClick={() => setActiveTab(item.id)}
+              className={`w-full flex items-center gap-4 px-4 py-3.5 rounded-2xl font-bold transition-all ${
+                activeTab === item.id ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-100' : 'text-slate-400 hover:bg-slate-50'
+              }`}
+            >
+              <item.icon size={22} /> {item.label}
             </button>
+          ))}
+        </nav>
+
+        <div className="bg-slate-50 rounded-3xl p-4 mt-auto">
+          <div className="flex items-center gap-3 mb-4">
+            <div className="w-10 h-10 rounded-full bg-white border border-slate-200 flex items-center justify-center overflow-hidden flex-shrink-0">
+              {user.photoURL && !user.isAnonymous ? <img src={user.photoURL} alt="avatar" /> : <User className="text-slate-400" />}
+            </div>
+            <div className="overflow-hidden">
+              <p className="text-sm font-bold truncate text-slate-800">{getUserDisplayName(user)}</p>
+              <p className="text-[10px] text-slate-400 truncate">{user.isAnonymous ? '資料僅存本機' : user.email}</p>
+            </div>
           </div>
+          <button onClick={handleLogout} className="w-full py-2 text-red-500 text-sm font-bold hover:bg-red-50 rounded-xl flex items-center justify-center gap-2 transition-colors">
+            <LogOut size={16} /> 登出
+          </button>
         </div>
       </aside>
 
-      <main className="max-w-6xl mx-auto p-6 md:p-10 2xl:pl-72">
-        <header className="flex flex-col md:flex-row md:items-center justify-between gap-6 mb-10">
-          <div>
-            <h1 className="text-3xl font-black tracking-tight text-slate-900">
-              {activeTab === 'classes' ? '班級管理' : activeTab === 'behavior' ? '行為計分紀錄' : '系統備份與設定'}
-            </h1>
-            <p className="text-slate-500 font-medium mt-1 2xl:hidden">{user.uid === 'local-guest' ? '訪客模式 (本機暫存)' : `歡迎回來，${getUserDisplayName(user)}`}</p>
+      {/* 底部導覽 (Mobile) */}
+      <nav className="fixed bottom-0 left-0 right-0 lg:hidden bg-white/90 backdrop-blur-xl border-t border-slate-100 flex justify-around p-3 z-50">
+        {[
+          { id: 'dashboard', icon: ClipboardList, label: '儀表板' },
+          { id: 'classes', icon: Users, label: '班級' },
+          { id: 'settings', icon: Settings, label: '設定' }
+        ].map(item => (
+          <button
+            key={item.id}
+            onClick={() => setActiveTab(item.id)}
+            className={`flex flex-col items-center gap-1 px-5 py-2 rounded-2xl transition-all ${
+              activeTab === item.id ? 'text-indigo-600 bg-indigo-50' : 'text-slate-400'
+            }`}
+          >
+            <item.icon size={24} />
+            <span className="text-[10px] font-bold">{item.label}</span>
+          </button>
+        ))}
+      </nav>
+
+      {/* 頂部 Header */}
+      <header className="sticky top-0 bg-white/90 backdrop-blur-md border-b border-slate-200 px-6 py-4 flex justify-between items-center z-40">
+        <div>
+          <h2 className="text-xl font-black text-slate-800">
+            {activeTab === 'dashboard' ? '計分管理' : activeTab === 'classes' ? '班級設定' : '系統設定'}
+          </h2>
+          <div className="flex items-center gap-1.5 mt-0.5">
+            <div className={`w-1.5 h-1.5 rounded-full ${syncStatus === 'success' ? 'bg-green-500' : syncStatus === 'syncing' ? 'bg-indigo-500 animate-pulse' : 'bg-slate-300'}`}></div>
+            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+              {syncStatus === 'syncing' ? 'Cloud Syncing' : syncStatus === 'success' ? 'Synced' : 'Local Only'}
+            </span>
           </div>
-          <div className="flex items-center gap-3 bg-white p-2 rounded-2xl border border-slate-100 shadow-sm">
-            {user.uid === 'local-guest' ? (
-               <div className="px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 bg-slate-50 text-slate-500">
-                 <div className="w-2 h-2 rounded-full bg-slate-400" /> 離線本機模式
-               </div>
+        </div>
+      </header>
+
+      {/* 主內容區 */}
+      <main className="flex-1 p-4 lg:p-8">
+        {/* ----------------- 儀表板 ----------------- */}
+        {activeTab === 'dashboard' && (
+          <div className="max-w-5xl mx-auto space-y-6">
+            
+            {/* 班級切換區 */}
+            <div className="flex gap-2 overflow-x-auto pb-2 -mx-4 px-4 no-scrollbar">
+              {appData.classes.map(cls => (
+                <button
+                  key={cls.id}
+                  onClick={() => { setSelectedClassId(cls.id); setIsSelectionMode(false); setSelectedStudents([]); }}
+                  className={`px-6 py-3 rounded-2xl font-bold text-sm whitespace-nowrap transition-all ${
+                    selectedClassId === cls.id ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-200 scale-105' : 'bg-white border border-slate-200 text-slate-500 hover:bg-slate-50'
+                  }`}
+                >
+                  {cls.name}
+                </button>
+              ))}
+              <button 
+                onClick={() => setActiveTab('classes')}
+                className="px-5 py-3 rounded-2xl font-bold text-sm whitespace-nowrap bg-indigo-50 text-indigo-600 flex items-center gap-2 border border-indigo-100 hover:bg-indigo-100 transition-colors"
+              >
+                <Settings size={16} /> 管理班級
+              </button>
+            </div>
+
+            {/* 動作列 (僅當有選擇班級時顯示) */}
+            {activeClassData && (
+              <div className="bg-white p-3 rounded-2xl shadow-sm border border-slate-200 flex flex-wrap gap-2 justify-between items-center">
+                <div className="flex items-center gap-2">
+                  {/* 視圖切換 (網格 / 表格) */}
+                  <div className="hidden sm:flex items-center bg-slate-100 p-1.5 rounded-xl border border-slate-200 mr-2">
+                    <button onClick={() => setViewMode('grid')} className={`p-1.5 rounded-lg transition-all ${viewMode==='grid'?'bg-white shadow-sm text-indigo-600':'text-slate-400 hover:text-slate-600'}`} title="卡片檢視"><LayoutGrid size={18}/></button>
+                    <button onClick={() => setViewMode('table')} className={`p-1.5 rounded-lg transition-all ${viewMode==='table'?'bg-white shadow-sm text-indigo-600':'text-slate-400 hover:text-slate-600'}`} title="條列檢視"><List size={18}/></button>
+                  </div>
+                  <button onClick={() => setModalOpen('editStudents')} className="p-2.5 bg-blue-50 text-blue-600 rounded-xl hover:bg-blue-100 transition-colors font-bold text-sm flex items-center gap-2">
+                    <UserCog size={18} /> <span className="hidden sm:inline">編輯名單</span>
+                  </button>
+                  <button onClick={exportCSV} className="p-2.5 bg-green-50 text-green-600 rounded-xl hover:bg-green-100 transition-colors font-bold text-sm flex items-center gap-2">
+                    <FileDown size={18} /> <span className="hidden sm:inline">匯出總表</span>
+                  </button>
+                </div>
+                <button 
+                  onClick={() => { setIsSelectionMode(!isSelectionMode); setSelectedStudents([]); }}
+                  className={`px-4 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 ${
+                    isSelectionMode ? 'bg-indigo-600 text-white shadow-md' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  }`}
+                >
+                  <CheckSquare size={18} /> {isSelectionMode ? '取消多選' : '多選模式'}
+                </button>
+              </div>
+            )}
+
+            {/* 學生呈現區域 (依據 viewMode 切換) */}
+            {activeClassData ? (
+              viewMode === 'table' ? (
+                /* --- 條列視圖 (Table View) --- */
+                <div className="bg-white rounded-[2rem] border border-slate-200 shadow-sm overflow-hidden mb-6">
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse">
+                      <thead>
+                        <tr className="bg-slate-50 border-b border-slate-100 text-slate-500 text-sm">
+                          {isSelectionMode && <th className="px-6 py-4 w-16 text-center">選取</th>}
+                          <th className="px-6 py-4 font-bold whitespace-nowrap">座號</th>
+                          <th className="px-6 py-4 font-bold whitespace-nowrap">姓名 <span className="text-xs text-slate-400 font-normal">(點擊看明細)</span></th>
+                          <th className="px-6 py-4 font-bold text-green-600 whitespace-nowrap">優點</th>
+                          <th className="px-6 py-4 font-bold text-red-500 whitespace-nowrap">缺點</th>
+                          <th className="px-6 py-4 font-bold text-indigo-600 whitespace-nowrap">總分</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-50">
+                        {activeClassData.students.map(st => (
+                          <tr 
+                            key={st.id}
+                            onClick={() => {
+                              if (isSelectionMode) {
+                                toggleStudentSelection(st.id);
+                              } else {
+                                setTargetStudentId(st.id);
+                                setModalOpen('profile');
+                              }
+                            }}
+                            className={`hover:bg-slate-50 transition-colors cursor-pointer ${selectedStudents.includes(st.id) ? 'bg-indigo-50/60' : ''}`}
+                          >
+                            {isSelectionMode && (
+                              <td className="px-6 py-4 text-center">
+                                <div className={`w-5 h-5 rounded-md mx-auto flex items-center justify-center border-2 transition-colors ${selectedStudents.includes(st.id) ? 'bg-indigo-600 border-indigo-600 text-white' : 'border-slate-300'}`}>
+                                  {selectedStudents.includes(st.id) && <Check size={14} strokeWidth={3}/>}
+                                </div>
+                              </td>
+                            )}
+                            <td className="px-6 py-4 font-bold text-slate-400">{st.seatNo || '-'}</td>
+                            <td className="px-6 py-4 font-black text-indigo-600 text-lg flex items-center gap-2">
+                              {st.name} <FileText size={14} className="text-slate-300 hover:text-indigo-400 transition-colors" />
+                            </td>
+                            <td className="px-6 py-4 font-bold text-green-600">+{st.positivePoints}</td>
+                            <td className="px-6 py-4 font-bold text-red-500">-{Math.abs(st.negativePoints)}</td>
+                            <td className="px-6 py-4 font-black text-indigo-600 text-xl">{st.totalPoints}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ) : (
+                /* --- 網格視圖 (Grid View) --- */
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5 gap-3 lg:gap-4">
+                  {activeClassData.students.map(st => (
+                    <button
+                      key={st.id}
+                      onClick={() => {
+                        if (isSelectionMode) {
+                          toggleStudentSelection(st.id);
+                        } else {
+                          setSelectedStudents([st.id]);
+                          setModalOpen('score');
+                        }
+                      }}
+                      className={`relative p-4 rounded-[2rem] border-2 transition-all text-left flex flex-col justify-between aspect-square ${
+                        selectedStudents.includes(st.id) 
+                          ? 'border-indigo-600 bg-indigo-50 shadow-inner' 
+                          : 'border-slate-100 bg-white shadow-sm hover:shadow-md hover:border-indigo-200'
+                      }`}
+                    >
+                      <div className="flex justify-between items-start w-full">
+                        <span className={`text-xs font-black px-2 py-1 rounded-lg ${selectedStudents.includes(st.id) ? 'bg-indigo-200 text-indigo-800' : 'bg-slate-100 text-slate-500'}`}>
+                          {st.seatNo || '-'}
+                        </span>
+                        {isSelectionMode && (
+                          <div className={`w-6 h-6 rounded-full flex items-center justify-center border-2 ${
+                            selectedStudents.includes(st.id) ? 'bg-indigo-600 border-indigo-600 text-white' : 'border-slate-200'
+                          }`}>
+                            {selectedStudents.includes(st.id) && <Check size={14} />}
+                          </div>
+                        )}
+                      </div>
+                      
+                      {/* 強調姓名，取消大字體總分 */}
+                      <div className="flex-1 flex items-center justify-center py-4">
+                         <span className="font-black text-slate-800 text-3xl truncate w-full text-center tracking-wide">{st.name}</span>
+                      </div>
+                      
+                      <div className="flex gap-1.5 w-full">
+                        <div className="flex flex-col items-center flex-1 rounded-xl py-1 bg-green-50/50">
+                          <span className="text-[9px] font-bold text-green-600">優</span>
+                          <span className="text-sm font-black text-green-700">{st.positivePoints}</span>
+                        </div>
+                        <div className="flex flex-col items-center flex-1 rounded-xl py-1 bg-red-50/50">
+                          <span className="text-[9px] font-bold text-red-500">缺</span>
+                          <span className="text-sm font-black text-red-600">{Math.abs(st.negativePoints)}</span>
+                        </div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )
             ) : (
-               <div className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 ${syncStatus === 'success' ? 'bg-green-50 text-green-600' : 'bg-blue-50 text-blue-600'}`}>
-                 <div className={`w-2 h-2 rounded-full ${syncStatus === 'success' ? 'bg-green-500' : 'bg-blue-500 animate-pulse'}`} /> 雲端連線中
-               </div>
+              <div className="py-24 text-center bg-white rounded-[3rem] border border-slate-100 shadow-sm mt-8">
+                <div className="w-24 h-24 bg-indigo-50 rounded-full flex items-center justify-center mx-auto mb-6 text-indigo-300">
+                  <GraduationCap size={48} />
+                </div>
+                <h3 className="text-xl font-black text-slate-800 mb-2">尚未選擇班級</h3>
+                <p className="text-slate-400 font-medium mb-6">請在上方選擇班級，或前往班級管理新增</p>
+                <button onClick={() => setActiveTab('classes')} className="bg-indigo-600 text-white px-8 py-3.5 rounded-2xl font-bold shadow-lg shadow-indigo-100 hover:scale-105 transition-transform">
+                  前往班級管理
+                </button>
+              </div>
             )}
           </div>
-        </header>
+        )}
 
-        {/* ---------------- 班級管理 ---------------- */}
+        {/* ----------------- 班級管理 ----------------- */}
         {activeTab === 'classes' && (
           <div className="max-w-3xl mx-auto space-y-6">
-            <div className="flex justify-end">
-              <button onClick={() => setModalOpen('importClass')} className="bg-indigo-600 text-white px-5 py-3 rounded-xl font-bold flex items-center gap-2 shadow-md hover:bg-indigo-700 transition-colors">
+            <div className="flex justify-between items-center">
+              <h3 className="text-2xl font-black text-slate-800 flex items-center gap-2">
+                <Users className="text-indigo-600" /> 現有班級
+              </h3>
+              <button onClick={() => setModalOpen('importClass')} className="bg-indigo-600 text-white px-5 py-2.5 rounded-xl font-bold flex items-center gap-2 shadow-md hover:bg-indigo-700 transition-colors">
                 <Plus size={18} /> 新增 / 匯入班級
               </button>
             </div>
+
             {appData.classes.length === 0 ? (
-              <EmptyState title="目前沒有班級" subtitle="點擊上方按鈕建立第一個班級" icon={<Users size={48}/>} />
+              <div className="bg-white p-12 rounded-[2.5rem] text-center border-2 border-dashed border-slate-200">
+                 <p className="text-slate-400 font-bold">目前沒有班級資料</p>
+              </div>
             ) : (
               <div className="grid gap-4">
-                {appData.classes.map(cls => (
-                  <div key={cls.id} className="flex flex-col sm:flex-row sm:items-center justify-between p-6 bg-white rounded-[2rem] shadow-sm border border-slate-100 gap-4">
-                    <div className="flex items-center gap-5">
-                      <div className="w-14 h-14 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center font-black text-2xl">
-                        {(cls.name || '班').charAt(0)}
-                      </div>
-                      <div>
-                        <p className="font-black text-xl text-slate-800">{cls.name}</p>
-                        <p className="text-sm text-slate-500 font-medium mt-1 flex items-center gap-1"><User size={14}/> {appData.students.filter(s=>s.classId===cls.id).length} 位學生</p>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <button onClick={() => { setSelectedClassId(cls.id); setModalOpen('editStudents'); }} className="px-4 py-2.5 bg-blue-50 text-blue-700 rounded-xl font-bold text-sm hover:bg-blue-100 flex items-center gap-1">
-                        <UserCog size={16} /> 編輯名單
-                      </button>
-                      <button onClick={() => { setSelectedClassId(cls.id); setActiveTab('behavior'); }} className="px-4 py-2.5 bg-slate-100 text-slate-700 rounded-xl font-bold text-sm hover:bg-slate-200 flex items-center gap-1">
-                        <ClipboardList size={16} /> 計分
-                      </button>
-                      <button onClick={() => handleDeleteClass(cls.id)} className="p-2.5 text-red-400 hover:bg-red-50 rounded-xl transition-all"><Trash2 size={20} /></button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* ---------------- 行為記錄 ---------------- */}
-        {activeTab === 'behavior' && (
-          <div className="space-y-6">
-            <div className="flex flex-col md:flex-row gap-4 items-center justify-between">
-              <div className="flex gap-2 overflow-x-auto w-full md:w-auto pb-2 -mx-4 px-4 sm:mx-0 sm:px-0 no-scrollbar 2xl:hidden">
-                {appData.classes.map(c => (
-                  <button 
-                    key={c.id} onClick={() => { setSelectedClassId(c.id); setIsMultiMode(false); setMultiSelect([]); }}
-                    className={`px-6 py-3 rounded-2xl font-bold text-sm whitespace-nowrap transition-all border-2 ${selectedClassId === c.id ? 'bg-indigo-600 border-indigo-600 text-white shadow-lg' : 'bg-white border-slate-100 text-slate-500'}`}
-                  >
-                    {c.name}
-                  </button>
-                ))}
-              </div>
-              <div className="flex items-center gap-2 w-full md:w-auto">
-                {/* 視圖切換 (總表 / 網格卡片) */}
-                <div className="hidden sm:flex items-center bg-slate-200/50 p-1.5 rounded-xl border border-slate-200">
-                  <button onClick={() => setViewMode('grid')} className={`p-1.5 rounded-lg transition-all ${viewMode==='grid'?'bg-white shadow-sm text-indigo-600':'text-slate-400 hover:text-slate-600'}`} title="卡片檢視"><LayoutGrid size={18}/></button>
-                  <button onClick={() => setViewMode('table')} className={`p-1.5 rounded-lg transition-all ${viewMode==='table'?'bg-white shadow-sm text-indigo-600':'text-slate-400 hover:text-slate-600'}`} title="總表檢視"><List size={18}/></button>
-                </div>
-                
-                <button onClick={() => { setIsMultiMode(!isMultiMode); setMultiSelect([]); }} className={`flex-1 md:flex-none px-4 py-2.5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${isMultiMode ? 'bg-amber-100 text-amber-700' : 'bg-white text-slate-700 border border-slate-200'}`}>
-                  <CheckSquare size={18} /> {isMultiMode ? '取消多選' : '多選模式'}
-                </button>
-                <button onClick={handleExport} disabled={!activeClassData} className="flex-1 md:flex-none px-4 py-2.5 bg-green-600 text-white rounded-xl font-bold text-sm flex items-center justify-center gap-2 hover:bg-green-700 disabled:opacity-50">
-                  <FileDown size={18} /> 下載總表
-                </button>
-              </div>
-            </div>
-
-            {activeClassData ? (
-              <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
-                <div className="xl:col-span-2">
-                   
-                   {/* 總表檢視 (Table View) */}
-                   {viewMode === 'table' ? (
-                     <div className="bg-white rounded-[2rem] border border-slate-200 shadow-sm overflow-hidden mb-6">
-                       <div className="overflow-x-auto">
-                         <table className="w-full text-left border-collapse">
-                           <thead>
-                             <tr className="bg-slate-50 border-b border-slate-100 text-slate-500 text-sm">
-                               {isMultiMode && <th className="px-6 py-4 w-16 text-center">選取</th>}
-                               <th className="px-6 py-4 font-bold whitespace-nowrap">座號</th>
-                               <th className="px-6 py-4 font-bold whitespace-nowrap">姓名</th>
-                               <th className="px-6 py-4 font-bold text-green-600 whitespace-nowrap">優點</th>
-                               <th className="px-6 py-4 font-bold text-red-500 whitespace-nowrap">缺點</th>
-                               <th className="px-6 py-4 font-bold text-indigo-600 whitespace-nowrap">總分</th>
-                             </tr>
-                           </thead>
-                           <tbody className="divide-y divide-slate-50">
-                             {activeClassData.students.map(stu => (
-                               <tr 
-                                 key={stu.id}
-                                 onClick={() => isMultiMode ? setMultiSelect(prev => prev.includes(stu.id) ? prev.filter(id=>id!==stu.id) : [...prev, stu.id]) : (() => { setMultiSelect([stu.id]); setModalOpen('score'); })()}
-                                 className={`hover:bg-slate-50 transition-colors cursor-pointer ${multiSelect.includes(stu.id) ? 'bg-indigo-50/60' : ''}`}
-                               >
-                                 {isMultiMode && (
-                                   <td className="px-6 py-4 text-center">
-                                     <div className={`w-5 h-5 rounded-md mx-auto flex items-center justify-center border-2 transition-colors ${multiSelect.includes(stu.id) ? 'bg-indigo-600 border-indigo-600 text-white' : 'border-slate-300'}`}>
-                                       {multiSelect.includes(stu.id) && <Check size={14} strokeWidth={3}/>}
-                                     </div>
-                                   </td>
-                                 )}
-                                 <td className="px-6 py-4 font-bold text-slate-400">{stu.seatNo || '-'}</td>
-                                 <td className="px-6 py-4 font-black text-slate-800 text-lg">{stu.name}</td>
-                                 <td className="px-6 py-4 font-bold text-green-600">+{stu.positivePoints}</td>
-                                 <td className="px-6 py-4 font-bold text-red-500">-{Math.abs(stu.negativePoints)}</td>
-                                 <td className="px-6 py-4 font-black text-indigo-600 text-xl">{stu.totalPoints}</td>
-                               </tr>
-                             ))}
-                           </tbody>
-                         </table>
-                         {activeClassData.students.length === 0 && (
-                           <div className="p-10 text-center text-slate-400 font-bold">此班級尚無學生名單</div>
-                         )}
-                       </div>
-                     </div>
-                   ) : (
-                     // 網格卡片檢視 (Grid View)
-                     <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3 lg:gap-4">
-                       {activeClassData.students.map(stu => (
-                         <div 
-                           key={stu.id}
-                           onClick={() => isMultiMode ? setMultiSelect(prev => prev.includes(stu.id) ? prev.filter(id=>id!==stu.id) : [...prev, stu.id]) : (() => { setMultiSelect([stu.id]); setModalOpen('score'); })()}
-                           className={`relative cursor-pointer p-4 rounded-3xl border-2 transition-all flex flex-col justify-between aspect-square active:scale-95 ${multiSelect.includes(stu.id) ? 'border-indigo-600 bg-indigo-50' : 'border-slate-100 bg-white shadow-sm hover:border-indigo-200'}`}
-                         >
-                           <div className="flex justify-between items-start w-full mb-1">
-                             <span className={`text-xs font-black px-2 py-1 rounded-lg ${multiSelect.includes(stu.id) ? 'bg-indigo-200 text-indigo-800' : 'bg-slate-100 text-slate-500'}`}>{stu.seatNo || '-'}</span>
-                             {isMultiMode && <div className={`w-6 h-6 rounded-full flex items-center justify-center border-2 ${multiSelect.includes(stu.id) ? 'bg-indigo-600 border-indigo-600 text-white' : 'border-slate-200'}`}>{multiSelect.includes(stu.id) && <Check size={14} />}</div>}
-                           </div>
-                           
-                           {/* 改為強調姓名 */}
-                           <div className="flex-1 flex items-center justify-center py-2">
-                             <span className="font-black text-slate-800 text-center truncate w-full text-2xl">{stu.name}</span>
-                           </div>
-                           
-                           {/* 在卡片下方簡單顯示優缺點提示 */}
-                           <div className="flex gap-1.5 w-full mt-2">
-                             <div className="flex-1 bg-green-50 text-green-700 text-[10px] font-bold py-1.5 rounded-lg text-center">優 {stu.positivePoints}</div>
-                             <div className="flex-1 bg-red-50 text-red-700 text-[10px] font-bold py-1.5 rounded-lg text-center">缺 {Math.abs(stu.negativePoints)}</div>
-                           </div>
-                         </div>
-                       ))}
-                     </div>
-                   )}
-
-                   {/* 多選操作列 */}
-                   {isMultiMode && multiSelect.length > 0 && (
-                     <div className="fixed bottom-24 lg:bottom-10 left-1/2 -translate-x-1/2 bg-slate-900 text-white px-6 py-4 rounded-full flex items-center gap-6 shadow-2xl z-50 animate-in slide-in-from-bottom-10">
-                        <span className="text-sm font-black whitespace-nowrap">已選 {multiSelect.length} 人</span>
-                        <div className="flex gap-2">
-                          <button onClick={() => setMultiSelect(activeClassData.students.map(s => s.id))} className="bg-white/20 px-4 py-2 rounded-full font-bold text-sm hover:bg-white/30 transition-colors">全選</button>
-                          <button onClick={() => setModalOpen('score')} className="bg-indigo-500 px-6 py-2 rounded-full font-black text-sm hover:bg-indigo-400 transition-colors shadow-lg">評分</button>
+                {appData.classes.map(cls => {
+                  const stuCount = appData.students.filter(s => s.classId === cls.id).length;
+                  return (
+                    <div key={cls.id} className="flex flex-col sm:flex-row sm:items-center justify-between p-6 bg-white rounded-[2rem] shadow-sm border border-slate-100 gap-4">
+                      <div className="flex items-center gap-4">
+                        <div className="w-14 h-14 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center font-black text-xl">
+                          {cls.name.charAt(0)}
                         </div>
-                     </div>
-                   )}
-                </div>
-
-                {/* 最近紀錄列表 */}
-                <div className="bg-white rounded-[2.5rem] border border-slate-100 p-6 shadow-sm h-fit">
-                   <div className="flex items-center justify-between mb-6">
-                     <h3 className="font-black text-lg flex items-center gap-2"><History size={20} className="text-indigo-600" /> 最近活動</h3>
-                   </div>
-                   <div className="space-y-4 max-h-[500px] overflow-y-auto pr-2">
-                     {appData.records.filter(r => r.classId === selectedClassId).slice(0, 15).map(rec => {
-                       const isValidDate = rec.timestamp && !isNaN(new Date(rec.timestamp).getTime());
-                       const timeStr = isValidDate ? new Date(rec.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-                       return (
-                       <div key={rec.id} className="flex gap-3 p-3 rounded-2xl bg-slate-50 border border-slate-100">
-                         <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${rec.type === 'positive' ? 'bg-green-100 text-green-600' : 'bg-red-100 text-red-600'}`}>
-                           {rec.type === 'positive' ? <ThumbsUp size={16} /> : <ThumbsDown size={16} />}
-                         </div>
-                         <div className="flex-1 min-w-0">
-                           <div className="flex justify-between items-center">
-                             <p className="font-bold text-sm text-slate-800 truncate">{rec.studentName}</p>
-                             <span className="text-[10px] font-bold text-slate-400">{timeStr}</span>
-                           </div>
-                           <p className="text-xs text-slate-500 font-medium truncate">{rec.item || '未分類'} ({rec.score > 0 ? '+' : ''}{rec.score}) {rec.note ? `- ${rec.note}` : ''}</p>
-                         </div>
-                       </div>
-                     )})}
-                     {appData.records.filter(r => r.classId === selectedClassId).length === 0 && (
-                       <p className="text-center py-10 text-slate-400 text-sm font-medium">尚無計分紀錄</p>
-                     )}
-                   </div>
-                </div>
+                        <div>
+                          <p className="font-black text-xl text-slate-800">{cls.name}</p>
+                          <p className="text-sm text-slate-500 font-medium mt-1 flex items-center gap-1">
+                            <User size={14}/> {stuCount} 位學生
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 self-end sm:self-auto">
+                        <button 
+                          onClick={() => { setSelectedClassId(cls.id); setActiveTab('dashboard'); }}
+                          className="px-5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold text-sm transition-colors"
+                        >
+                          進入計分
+                        </button>
+                        <button 
+                          onClick={() => handleDeleteClass(cls.id)}
+                          className="p-2.5 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-all"
+                          title="刪除班級"
+                        >
+                          <Trash2 size={20} />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
-            ) : (
-              <EmptyState title="請選擇班級" subtitle="從上方列表或左側選單切換班級以開始計分" icon={<LayoutDashboard size={48}/>} />
             )}
           </div>
         )}
 
-        {/* ---------------- 系統設定 ---------------- */}
+        {/* ----------------- 系統設定 ----------------- */}
         {activeTab === 'settings' && (
-          <div className="max-w-2xl space-y-6">
+          <div className="max-w-2xl mx-auto space-y-6">
             
-            {/* 帳號管理置頂：強調雲端自動同步 */}
-            <div className="bg-white rounded-[2.5rem] border border-slate-100 p-8 shadow-sm">
-               <h3 className="font-black text-xl mb-2 flex items-center gap-2 text-slate-800">
-                 <User size={24} className="text-indigo-600" /> 帳號管理
-               </h3>
-               <p className="text-sm text-slate-500 mb-6 font-medium">登入 Google 帳號後，您的資料會自動且即時地同步至 Firebase 雲端資料庫，確保資料安全不遺失。</p>
-               
-               <div className="flex items-center gap-4 mb-6 p-4 bg-slate-50 rounded-2xl border border-slate-100">
-                 <div className="w-12 h-12 rounded-full bg-white border border-slate-200 flex items-center justify-center overflow-hidden flex-shrink-0">
-                    {user?.photoURL && user.uid !== 'local-guest' ? <img src={user.photoURL} alt="avatar" /> : <User className="text-slate-400" size={24} />}
-                 </div>
-                 <div className="overflow-hidden">
-                   <p className="text-base font-bold truncate text-slate-800">{getUserDisplayName(user)}</p>
-                   <p className="text-xs text-slate-500 truncate">{user.uid === 'local-guest' ? '目前為訪客模式 (資料僅存本機)' : user.email}</p>
-                 </div>
-               </div>
+            {/* 帳號區塊：強調自動同步 */}
+            <div className="bg-white rounded-[2.5rem] p-8 shadow-sm border border-slate-100">
+              <h3 className="text-xl font-black mb-2 flex items-center gap-2 text-slate-800">
+                <Cloud className="text-indigo-600" /> 帳號管理與雲端備份
+              </h3>
+              <p className="text-sm text-slate-500 mb-6 font-medium leading-relaxed">
+                只要登入 Google 帳號，您的所有資料與評分紀錄都會<strong className="text-indigo-600">自動且即時地同步至 Firebase 雲端資料庫</strong>，確保資料安全不遺失。
+              </p>
 
-               <button onClick={handleLogout} className="w-full py-4 bg-red-50 text-red-600 rounded-2xl font-bold hover:bg-red-100 flex items-center justify-center gap-2 transition-colors">
-                 <LogOut size={20} /> {user.uid === 'local-guest' ? '登出訪客模式' : '登出系統'}
-               </button>
+              <div className="flex items-center justify-between p-6 bg-slate-50 rounded-3xl mb-6 border border-slate-100">
+                <div className="flex items-center gap-4">
+                  <div className="w-16 h-16 bg-white rounded-2xl flex items-center justify-center border border-slate-200 shadow-sm overflow-hidden flex-shrink-0">
+                    {user.photoURL && !user.isAnonymous ? <img src={user.photoURL} alt="avatar" /> : <User size={32} className="text-slate-300" />}
+                  </div>
+                  <div className="overflow-hidden">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="font-black text-xl text-slate-800 truncate">{getUserDisplayName(user)}</span>
+                    </div>
+                    <p className="text-slate-500 text-sm font-medium truncate">
+                      {user.isAnonymous ? '目前為訪客模式 (資料僅存本機)' : user.email}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {user.isAnonymous ? (
+                <div className="space-y-3">
+                  <button onClick={handleGoogleLogin} className="w-full py-4 bg-indigo-600 text-white rounded-2xl font-bold shadow-lg shadow-indigo-100 active:scale-95 transition flex justify-center items-center gap-2">
+                    <Cloud size={20}/> 登入 Google 啟用雲端備份
+                  </button>
+                  <button onClick={handleLogout} className="w-full py-4 bg-red-50 text-red-600 border border-red-100 rounded-2xl font-bold active:scale-95 transition flex justify-center items-center gap-2">
+                    <Trash2 size={20}/> 清除目前的訪客資料
+                  </button>
+                </div>
+              ) : (
+                <div className="flex gap-3">
+                  <button onClick={() => saveState(appData)} className="flex-1 py-4 bg-indigo-600 text-white rounded-2xl font-bold shadow-lg shadow-indigo-100 active:scale-95 transition flex justify-center items-center gap-2">
+                    <RefreshCw size={20}/> 手動強制同步
+                  </button>
+                  <button onClick={handleLogout} className="flex-1 py-4 bg-red-50 text-red-600 border border-red-100 rounded-2xl font-bold active:scale-95 transition flex justify-center items-center gap-2">
+                    <LogOut size={20}/> 登出系統
+                  </button>
+                </div>
+              )}
             </div>
 
-            {/* GAS 作為第二備案的區塊 */}
-            <div className="bg-white rounded-[2.5rem] border border-slate-100 p-8 shadow-sm">
-              <h3 className="font-black text-xl mb-2 flex items-center gap-2"><Database size={24} className="text-green-600"/> GAS 備用同步方案</h3>
-              <p className="text-sm text-slate-500 mb-4 font-medium">這是同步資料的<strong className="text-amber-600">備案第二方案（非必填）</strong>。若您希望額外將資料備份到 Google Sheets 試算表以方便瀏覽，才需要進行設定：</p>
+            {/* GAS 備份區塊：備用第二方案 */}
+            <div className="bg-white rounded-[2.5rem] p-8 shadow-sm border border-slate-100">
+              <h3 className="text-xl font-black mb-2 flex items-center gap-2 text-slate-800">
+                <Database className="text-green-600" /> GAS 備用同步方案
+              </h3>
+              <p className="text-sm text-slate-500 font-medium mb-6 leading-relaxed">
+                這是<strong className="text-amber-600">備案第二方案（非必填）</strong>。若您希望額外將資料寫入 Google Sheets 試算表以方便瀏覽或留存，才需要進行下方設定：
+              </p>
               
-              <div className="flex flex-col sm:flex-row gap-2 mb-4">
-                <input 
-                  type="text" 
-                  value={appData.settings.gasUrl || ''} 
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    setAppData(prev => {
-                      const next = {...prev, settings: { ...prev.settings, gasUrl: val }};
-                      localStorage.setItem('school_moral_v2', JSON.stringify(next));
-                      return next;
-                    });
-                  }}
-                  className="flex-1 bg-slate-50 border-2 border-slate-100 rounded-xl px-4 py-3 font-medium text-sm focus:border-green-500 outline-none"
-                  placeholder="https://script.google.com/macros/s/..."
-                />
-                <button 
-                  onClick={async () => {
-                    if (user && user.uid !== 'local-guest') {
-                      await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'config'), appData.settings);
-                    }
-                    showNotify("網址已儲存至本機");
-                  }}
-                  className="px-6 py-3 bg-slate-100 text-slate-600 rounded-xl font-bold text-sm hover:bg-slate-200 transition-colors whitespace-nowrap"
-                >儲存網址</button>
-              </div>
-
-              {/* 上傳與下載按鈕區塊 */}
-              <div className="flex flex-col gap-3 mt-6">
-                <button 
-                  onClick={handleGasManualSync}
-                  className="w-full py-4 bg-indigo-600 text-white rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-indigo-700 transition-colors shadow-md shadow-indigo-100"
-                >
-                  <UploadCloud size={20}/> 將手機資料「備份上傳」到 GAS
-                </button>
-
-                <button 
-                  onClick={handleGasDownload}
-                  className="w-full py-4 bg-amber-50 text-amber-700 border border-amber-200 rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-amber-100 transition-colors"
-                >
-                  <FileDown size={20}/> 從 GAS「下載舊資料」並自動修復相容
-                </button>
-                
-                <p className="text-[10px] text-slate-400 text-center mt-1">
-                  提示：若點擊下載，系統會自動將舊版的「日期」及「點數」轉換為新版格式。
-                </p>
-              </div>
-
-              {/* GAS 教學區塊 (包含新版完美相容腳本) */}
-              <div className="mt-8 border-t border-slate-100 pt-6">
-                <button 
-                  onClick={() => setShowGasTutorial(!showGasTutorial)}
-                  className="text-sm font-bold text-indigo-600 hover:text-indigo-700 flex items-center gap-1"
-                >
-                  {showGasTutorial ? <ChevronRight className="rotate-90 transition-transform" size={16}/> : <ChevronRight className="transition-transform" size={16}/>} 
-                  如何設定支援「雙向同步」與「Excel 自動分類」的 GAS 程式碼？
-                </button>
-                
-                {showGasTutorial && (
-                  <div className="mt-4 bg-slate-50 p-6 rounded-2xl border border-slate-200 text-sm text-slate-700 space-y-4">
-                    <p className="font-black text-slate-900">這是一份升級版的 GAS 程式碼，完美結合了舊版的「各班獨立工作表分類」以及新版的「JSON 即時同步」功能。</p>
-                    
-                    <p className="font-black text-slate-900">1. 在 Google 試算表中，開啟「擴充功能」 {'>'} 「Apps Script」</p>
-                    <p className="font-black text-slate-900">2. 貼上以下全新程式碼：</p>
-                    <div className="relative group">
-                      <pre className="bg-slate-800 text-slate-50 p-4 rounded-xl overflow-x-auto text-xs font-mono leading-relaxed max-h-60 overflow-y-auto">
-{`function doGet(e) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var dbSheet = ss.getSheetByName('系統資料庫_勿刪');
-  var dataStr = "{}";
-  if (dbSheet) {
-    dataStr = dbSheet.getRange("A1").getValue() || "{}";
-  }
-  return ContentService.createTextOutput(dataStr).setMimeType(ContentService.MimeType.JSON);
-}
-
-function doPost(e) {
-  try {
-    var payload = JSON.parse(e.postData.contents);
-    var data = payload.data || payload;
-    if (data) {
-      saveDatabase(data);
-      updateReadableSheets(data);
-    }
-    return ContentService.createTextOutput(JSON.stringify({status: 'success'})).setMimeType(ContentService.MimeType.JSON);
-  } catch (err) {
-    return ContentService.createTextOutput(JSON.stringify({error: err.toString()})).setMimeType(ContentService.MimeType.JSON);
-  }
-}
-
-function saveDatabase(data) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName('系統資料庫_勿刪');
-  if (!sheet) {
-    sheet = ss.insertSheet('系統資料庫_勿刪');
-    sheet.hideSheet();
-  }
-  sheet.getRange('A1').setValue(JSON.stringify(data));
-}
-
-function updateReadableSheets(data) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  if (!data.classes) return;
-  
-  data.classes.forEach(function(cls) {
-    var sheet = ss.getSheetByName(cls.name);
-    if (!sheet) sheet = ss.insertSheet(cls.name);
-    sheet.clear();
-    
-    var headers = ['日期', '座號', '姓名', '類別', '項目', '分數', '備註'];
-    var rows = [headers];
-    
-    var classRecords = data.records.filter(function(r) { return r.classId === cls.id; });
-    classRecords.forEach(function(r) {
-      var student = data.students.find(function(s) { return s.id === r.studentId; }) || {};
-      var typeName = r.type === 'positive' ? '獎勵' : '懲處';
-      
-      // 處理日期格式
-      var dateStr = "";
-      if (r.timestamp) {
-        var d = new Date(r.timestamp);
-        dateStr = d.getFullYear() + '/' + (d.getMonth()+1) + '/' + d.getDate();
-      } else if (r.date) {
-        dateStr = r.date;
-      }
-
-      var score = r.score !== undefined ? r.score : (r.points !== undefined ? r.points : 0);
-      
-      rows.push([dateStr, student.seatNo || '', student.name || '', typeName, r.item || '', score, r.note || '']);
-    });
-    
-    if (rows.length > 1) {
-      sheet.getRange(1, 1, rows.length, headers.length).setValues(rows);
-    }
-  });
-}`}
-                      </pre>
-                      <button 
-                        onClick={() => {
-                          const code = `function doGet(e) {\n  var ss = SpreadsheetApp.getActiveSpreadsheet();\n  var dbSheet = ss.getSheetByName('系統資料庫_勿刪');\n  var dataStr = "{}";\n  if (dbSheet) {\n    dataStr = dbSheet.getRange("A1").getValue() || "{}";\n  }\n  return ContentService.createTextOutput(dataStr).setMimeType(ContentService.MimeType.JSON);\n}\n\nfunction doPost(e) {\n  try {\n    var payload = JSON.parse(e.postData.contents);\n    var data = payload.data || payload;\n    if (data) {\n      saveDatabase(data);\n      updateReadableSheets(data);\n    }\n    return ContentService.createTextOutput(JSON.stringify({status: 'success'})).setMimeType(ContentService.MimeType.JSON);\n  } catch (err) {\n    return ContentService.createTextOutput(JSON.stringify({error: err.toString()})).setMimeType(ContentService.MimeType.JSON);\n  }\n}\n\nfunction saveDatabase(data) {\n  var ss = SpreadsheetApp.getActiveSpreadsheet();\n  var sheet = ss.getSheetByName('系統資料庫_勿刪');\n  if (!sheet) {\n    sheet = ss.insertSheet('系統資料庫_勿刪');\n    sheet.hideSheet();\n  }\n  sheet.getRange('A1').setValue(JSON.stringify(data));\n}\n\nfunction updateReadableSheets(data) {\n  var ss = SpreadsheetApp.getActiveSpreadsheet();\n  if (!data.classes) return;\n  \n  data.classes.forEach(function(cls) {\n    var sheet = ss.getSheetByName(cls.name);\n    if (!sheet) sheet = ss.insertSheet(cls.name);\n    sheet.clear();\n    \n    var headers = ['日期', '座號', '姓名', '類別', '項目', '分數', '備註'];\n    var rows = [headers];\n    \n    var classRecords = data.records.filter(function(r) { return r.classId === cls.id; });\n    classRecords.forEach(function(r) {\n      var student = data.students.find(function(s) { return s.id === r.studentId; }) || {};\n      var typeName = r.type === 'positive' ? '獎勵' : '懲處';\n      \n      var dateStr = "";\n      if (r.timestamp) {\n        var d = new Date(r.timestamp);\n        dateStr = d.getFullYear() + '/' + (d.getMonth()+1) + '/' + d.getDate();\n      } else if (r.date) {\n        dateStr = r.date;\n      }\n\n      var score = r.score !== undefined ? r.score : (r.points !== undefined ? r.points : 0);\n      \n      rows.push([dateStr, student.seatNo || '', student.name || '', typeName, r.item || '', score, r.note || '']);\n    });\n    \n    if (rows.length > 1) {\n      sheet.getRange(1, 1, rows.length, headers.length).setValues(rows);\n    }\n  });\n}`;
-                          navigator.clipboard.writeText(code).then(() => showNotify("程式碼已複製！"));
-                        }}
-                        className="absolute top-2 right-2 px-3 py-1.5 bg-white/20 hover:bg-white/30 text-white rounded-lg text-xs font-bold transition-colors opacity-0 group-hover:opacity-100"
-                      >複製程式碼</button>
-                    </div>
-
-                    <p className="font-black text-slate-900 text-red-600">3. 重要！必須「建立新版本」</p>
-                    <p>在 GAS 編輯器點擊右上角的「部署」 {'>'} 「管理部署作業」，點選鉛筆圖示，在「版本」選擇<strong>「建立新版本」</strong>後點擊部署，這樣新程式碼才會生效！</p>
-                  </div>
-                )}
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-xs font-bold text-slate-400 uppercase tracking-wider mb-2 ml-2">Google App Script (GAS) 網址</label>
+                  <input 
+                    type="text" 
+                    value={apiUrl} 
+                    onChange={(e) => { setApiUrl(e.target.value); localStorage.setItem('gas_api_url', e.target.value); }}
+                    placeholder="https://script.google.com/macros/s/.../exec"
+                    className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:border-green-500 focus:ring-2 focus:ring-green-100 font-medium text-sm transition-all"
+                  />
+                </div>
+                <div className="flex gap-3">
+                  <button 
+                    onClick={() => saveState(appData)} 
+                    disabled={!apiUrl}
+                    className="flex-1 py-3.5 bg-green-50 text-green-700 rounded-xl font-bold active:scale-95 transition-all disabled:opacity-50 disabled:bg-slate-50 disabled:text-slate-400"
+                  >
+                    備份至試算表
+                  </button>
+                  <button 
+                    onClick={fetchFromGasCloud} 
+                    disabled={!apiUrl}
+                    className="flex-1 py-3.5 bg-green-600 text-white rounded-xl font-bold active:scale-95 transition-all disabled:opacity-50 flex items-center justify-center gap-2 shadow-md shadow-green-100"
+                  >
+                    <FileDown size={18} /> 從試算表下載
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -866,232 +835,384 @@ function updateReadableSheets(data) {
         )}
       </main>
 
-      {/* ---------------- Modals ---------------- */}
-      <Modal isOpen={modalOpen === 'importClass'} onClose={() => setModalOpen(null)} title="新增班級">
-        <ImportClassModal onSave={handleAddClass} showNotify={showNotify} />
-      </Modal>
-
-      <Modal isOpen={modalOpen === 'editStudents'} onClose={() => setModalOpen(null)} title="編輯學生名單">
-        <EditStudentsModal 
-          classId={selectedClassId} 
-          students={appData.students.filter(s => s.classId === selectedClassId)} 
-          onAdd={(seatNo, name) => handleAddStudent(selectedClassId, seatNo, name)}
-          onDelete={handleDeleteStudent}
-        />
-      </Modal>
-
-      <Modal isOpen={modalOpen === 'score'} onClose={() => setModalOpen(null)} title={multiSelect.length === 1 ? appData.students.find(s=>s.id===multiSelect[0])?.name : `批次給分 (${multiSelect.length}人)`}>
-        <ScoreModal onSave={(type, item, pts, note) => handleScore(multiSelect, type, item, pts, note)} />
-      </Modal>
-    </div>
-  );
-}
-
-// --- 輔助 UI 組件 ---
-const NavButton = ({ active, onClick, icon, label }) => (
-  <button onClick={onClick} className={`flex flex-col lg:flex-row items-center gap-1 lg:gap-4 p-3 lg:w-full lg:px-6 rounded-2xl transition-all ${active ? 'bg-indigo-50 text-indigo-600' : 'text-slate-400 hover:bg-slate-50 hover:text-slate-600'}`}>
-    {icon}
-    <span className="text-[10px] lg:text-sm font-black tracking-wider">{label}</span>
-  </button>
-);
-
-const EmptyState = ({ title, subtitle, icon }) => (
-  <div className="bg-white border-2 border-dashed border-slate-200 rounded-[3rem] p-16 text-center">
-    <div className="w-20 h-20 bg-slate-50 text-slate-300 rounded-[2rem] flex items-center justify-center mx-auto mb-6">{icon}</div>
-    <h3 className="text-xl font-black text-slate-800">{title}</h3>
-    <p className="text-slate-400 font-medium mt-1">{subtitle}</p>
-  </div>
-);
-
-const Modal = ({ isOpen, onClose, title, children }) => {
-  if (!isOpen) return null;
-  return (
-    <div className="fixed inset-0 z-[100] flex items-end sm:items-center justify-center p-0 sm:p-4">
-      <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative bg-white w-full max-w-lg sm:rounded-[2.5rem] rounded-t-[2.5rem] shadow-2xl overflow-hidden animate-in slide-in-from-bottom-full sm:slide-in-from-bottom-0 sm:zoom-in-95">
-        <div className="flex items-center justify-between p-6 border-b border-slate-50">
-          <h3 className="text-xl font-black text-slate-900">{title}</h3>
-          <button onClick={onClose} className="p-2 hover:bg-slate-100 bg-slate-50 rounded-full text-slate-500"><X size={20}/></button>
+      {/* 浮動多選動作條 */}
+      {isSelectionMode && selectedStudents.length > 0 && (
+        <div className="fixed bottom-24 lg:bottom-10 left-1/2 -translate-x-1/2 bg-slate-900 text-white px-6 py-4 rounded-full flex items-center gap-6 shadow-2xl z-50 animate-in slide-in-from-bottom-10">
+          <span className="text-sm font-black whitespace-nowrap">已選 {selectedStudents.length} 人</span>
+          <div className="flex gap-2">
+            <button 
+              onClick={selectAllStudents}
+              className="bg-white/20 hover:bg-white/30 px-4 py-2 rounded-full font-bold text-sm transition-colors"
+            >
+              全選
+            </button>
+            <button 
+              onClick={() => setModalOpen('score')}
+              className="bg-indigo-500 hover:bg-indigo-400 px-6 py-2 rounded-full font-black text-sm shadow-lg transition-colors"
+            >
+              評分
+            </button>
+          </div>
         </div>
-        <div className="p-6 max-h-[80vh] overflow-y-auto">{children}</div>
-      </div>
-    </div>
-  );
-};
+      )}
 
-// --- 功能 Modal 內容 ---
-function ImportClassModal({ onSave, showNotify }) {
-  const [className, setClassName] = useState('');
-  const [selectedFile, setSelectedFile] = useState(null);
-  const [isImporting, setIsImporting] = useState(false);
-  const fileInputRef = useRef(null);
+      {/* ----------------- Modals ----------------- */}
+      
+      {/* 1. 評分 Modal */}
+      {modalOpen === 'score' && (
+        <ScoreModal 
+          selectedCount={selectedStudents.length}
+          singleName={selectedStudents.length === 1 ? appData.students.find(s=>s.id===selectedStudents[0])?.name : null}
+          onClose={() => { setModalOpen(null); if(isSelectionMode) setIsSelectionMode(false); setSelectedStudents([]); }}
+          onSave={handleSaveRecords}
+        />
+      )}
 
-  const handleFile = (e) => {
-    const file = e.target.files[0];
-    if (file && ['.csv', '.xlsx', '.xls'].some(ext => file.name.toLowerCase().endsWith(ext))) {
-      setSelectedFile(file);
-    } else {
-      showNotify("請上傳 .csv 或 .xlsx 格式的檔案！");
-    }
-  };
+      {/* 2. 匯入/新增班級 Modal */}
+      {modalOpen === 'importClass' && (
+        <ImportClassModal 
+          onClose={() => setModalOpen(null)}
+          onSave={handleAddClass}
+          showNotify={showNotify}
+        />
+      )}
 
-  const handleSubmit = async () => {
-    if (!className.trim()) {
-        showNotify("請輸入班級名稱");
-        return;
-    }
-    if (!selectedFile) {
-        onSave({ name: className.trim() }, []);
-        return;
-    }
-    
-    setIsImporting(true);
-    showNotify("正在掃描名單...");
+      {/* 3. 編輯學生名單 Modal */}
+      {modalOpen === 'editStudents' && activeClassData && (
+        <EditStudentsModal
+          className={activeClassData.name}
+          classId={activeClassData.id}
+          students={activeClassData.students}
+          onClose={() => setModalOpen(null)}
+          onSave={(newStudents) => { handleUpdateStudents(activeClassData.id, newStudents); setModalOpen(null); }}
+        />
+      )}
 
-    try {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        try {
-          const workbook = XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
-          const sheet = workbook.Sheets[workbook.SheetNames[0]];
-          const json = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" }); 
-          
-          if (!json.length) throw new Error("檔案為空");
+      {/* 4. 新增：個人紀錄檔案 Modal */}
+      {modalOpen === 'profile' && targetStudentProfile && (
+        <ProfileModal 
+          student={targetStudentProfile}
+          records={targetStudentProfile.records}
+          onClose={() => { setModalOpen(null); setTargetStudentId(null); }}
+          onDeleteRecord={handleDeleteRecord}
+        />
+      )}
 
-          let headerRowIndex = -1, sIdx = -1, nIdx = -1;
-          for (let i = 0; i < Math.min(json.length, 10); i++) {
-            const row = json[i].map(cell => cell.toString().trim());
-            const foundS = row.findIndex(h => h.includes('座號') || h.includes('號碼') || h.includes('學號') || h === 'No');
-            const foundN = row.findIndex(h => h.includes('姓名') || h === 'Name');
-
-            if (foundS !== -1 && foundN !== -1) {
-              headerRowIndex = i; sIdx = foundS; nIdx = foundN; break; 
-            }
-          }
-
-          if (headerRowIndex === -1) throw new Error("找不到包含「座號」與「姓名」的標題欄");
-
-          const students = [];
-          for (let i = headerRowIndex + 1; i < json.length; i++) {
-            const row = json[i];
-            const seatNo = row[sIdx]?.toString().trim();
-            const name = row[nIdx]?.toString().trim();
-            if (seatNo || name) students.push({ seatNo: seatNo || (students.length + 1), name: name || "未命名" });
-          }
-
-          if (students.length === 0) throw new Error("沒有找到有效的學生資料");
-
-          onSave({ name: className.trim() }, students);
-        } catch (err) { 
-          showNotify("匯入失敗：" + err.message); 
-          setIsImporting(false); 
-        }
-      };
-      reader.readAsArrayBuffer(selectedFile);
-    } catch (err) { 
-      showNotify("讀取檔案時發生錯誤"); 
-      setIsImporting(false); 
-    }
-  };
-
-  return (
-    <div className="space-y-6">
-      <div>
-        <label className="block text-sm font-bold text-slate-700 mb-2">1. 班級名稱</label>
-        <input autoFocus value={className} onChange={e => setClassName(e.target.value)} placeholder="例如：101班" className="w-full bg-slate-50 border-2 border-slate-100 focus:border-indigo-500 rounded-2xl p-4 outline-none font-bold transition-all" />
-      </div>
-      <div>
-        <label className="block text-sm font-bold text-slate-700 mb-2">2. 匯入名單 (選填)</label>
-        {!selectedFile ? (
-          <div onClick={() => fileInputRef.current.click()} className="border-2 border-dashed border-slate-300 bg-slate-50 rounded-2xl p-8 text-center cursor-pointer hover:bg-indigo-50 hover:border-indigo-300 transition-colors">
-            <input type="file" ref={fileInputRef} onChange={handleFile} accept=".csv, .xlsx, .xls" className="hidden" />
-            <UploadCloud className="w-10 h-10 text-indigo-400 mx-auto mb-2" />
-            <p className="font-bold text-slate-600">點擊上傳 Excel 名單</p>
-            <p className="text-xs text-slate-400 mt-1">需包含「座號/學號」與「姓名」</p>
-          </div>
-        ) : (
-          <div className="bg-indigo-50 border border-indigo-100 rounded-2xl p-4 flex justify-between items-center">
-            <div className="flex items-center gap-3 overflow-hidden">
-              <FileSpreadsheet className="w-8 h-8 text-indigo-600 flex-shrink-0" />
-              <span className="font-bold text-indigo-700 truncate">{selectedFile.name}</span>
-            </div>
-            <button onClick={() => setSelectedFile(null)} className="p-2 bg-white rounded-full text-slate-400 hover:text-red-500 shadow-sm transition-colors"><X size={16}/></button>
-          </div>
-        )}
-      </div>
-      <button onClick={handleSubmit} disabled={!className || isImporting} className="w-full py-4 bg-indigo-600 text-white rounded-2xl font-black shadow-lg disabled:opacity-50 flex justify-center items-center gap-2 transition-all active:scale-95">
-        {isImporting ? <RefreshCw className="animate-spin w-5 h-5"/> : <CheckCircle2 size={20}/>} 
-        {selectedFile ? '匯入並建立' : '建立空班級'}
-      </button>
     </div>
   );
 }
 
-function EditStudentsModal({ classId, students, onAdd, onDelete }) {
-  const [newSeat, setNewSeat] = useState('');
-  const [newName, setNewName] = useState('');
+// ==========================================
+// 獨立 Modal 元件
+// ==========================================
 
-  const addStudent = () => {
-    if (!newSeat || !newName) return;
-    onAdd(newSeat, newName);
-    setNewSeat(''); setNewName('');
-  };
+// --- 個人檔案 Modal (新增功能) ---
+function ProfileModal({ student, records, onClose, onDeleteRecord }) {
+  // 統計分數
+  const posPoints = records.filter(r => r.points > 0).reduce((sum, r) => sum + r.points, 0);
+  const negPoints = records.filter(r => r.points < 0).reduce((sum, r) => sum + r.points, 0);
+  const total = posPoints + negPoints;
 
   return (
-    <div className="space-y-6">
-      <div className="bg-indigo-50 p-4 rounded-2xl border border-indigo-100 flex gap-2">
-        <input type="number" value={newSeat} onChange={e=>setNewSeat(e.target.value)} placeholder="座號" className="w-20 p-3 rounded-xl border border-white font-bold outline-none text-center" />
-        <input type="text" value={newName} onChange={e=>setNewName(e.target.value)} placeholder="轉入生姓名" className="flex-1 p-3 rounded-xl border border-white font-bold outline-none" />
-        <button onClick={addStudent} disabled={!newSeat||!newName} className="bg-indigo-600 text-white px-4 rounded-xl font-bold disabled:opacity-50 active:scale-95 transition-transform"><Plus size={20}/></button>
-      </div>
-      <div className="bg-slate-50 border border-slate-100 rounded-2xl p-2 max-h-[300px] overflow-y-auto">
-        {students.sort((a,b)=> (parseInt(a.seatNo)||0)-(parseInt(b.seatNo)||0)).map(s => (
-          <div key={s.id} className="flex justify-between items-center p-3 bg-white mb-2 rounded-xl shadow-sm border border-slate-100">
-            <div className="flex gap-3 items-center">
-              <span className="w-8 text-center text-xs font-black text-slate-400 bg-slate-50 py-1 rounded-md">{s.seatNo}</span>
-              <span className="font-bold text-slate-700">{s.name}</span>
-            </div>
-            <button onClick={() => onDelete(s.id)} className="text-slate-300 hover:text-red-500 p-1.5 transition-colors"><Trash2 size={16}/></button>
+    <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-end sm:items-center justify-center z-[100] p-0 sm:p-4">
+      <div className="bg-white w-full max-w-lg rounded-t-[2.5rem] sm:rounded-[2.5rem] p-6 sm:p-8 shadow-2xl animate-in slide-in-from-bottom-full sm:slide-in-from-bottom-0 sm:zoom-in-95 max-h-[90vh] flex flex-col">
+        
+        <div className="flex justify-between items-center mb-6 flex-shrink-0">
+          <div>
+            <p className="text-xs font-black text-slate-400 uppercase tracking-wider mb-1">座號 {student.seatNo || '-'}</p>
+            <h3 className="text-2xl font-black text-indigo-600">{student.name} 的紀錄明細</h3>
           </div>
-        ))}
+          <button onClick={onClose} className="p-2.5 bg-slate-100 hover:bg-slate-200 rounded-full text-slate-500 transition-colors">
+            <X size={24} />
+          </button>
+        </div>
+
+        <div className="flex gap-3 mb-6 flex-shrink-0">
+          <div className="flex-1 bg-slate-50 border border-slate-100 p-4 rounded-2xl text-center">
+            <p className="text-xs font-bold text-slate-400 mb-1">總計</p>
+            <p className={`text-2xl font-black ${total >= 0 ? 'text-indigo-600' : 'text-red-500'}`}>{total}</p>
+          </div>
+          <div className="flex-1 bg-green-50 border border-green-100 p-4 rounded-2xl text-center">
+            <p className="text-xs font-bold text-green-600/70 mb-1">優點</p>
+            <p className="text-2xl font-black text-green-600">+{posPoints}</p>
+          </div>
+          <div className="flex-1 bg-red-50 border border-red-100 p-4 rounded-2xl text-center">
+            <p className="text-xs font-bold text-red-500/70 mb-1">缺點</p>
+            <p className="text-2xl font-black text-red-500">-{Math.abs(negPoints)}</p>
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto pr-2 min-h-[250px]">
+          {records.length === 0 ? (
+            <div className="py-12 text-center text-slate-400 font-bold border-2 border-dashed border-slate-100 rounded-3xl">
+              目前沒有任何紀錄
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {records.map(rec => (
+                <div key={rec.id} className="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm flex items-center gap-4 group">
+                  <div className={`w-12 h-12 rounded-xl flex items-center justify-center flex-shrink-0 font-black text-lg ${rec.points > 0 ? 'bg-green-100 text-green-600' : 'bg-red-100 text-red-600'}`}>
+                    {rec.points > 0 ? '+' : ''}{rec.points}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="font-black text-slate-800 text-base">{rec.item || '未分類'}</p>
+                    <div className="flex items-center gap-2 mt-1">
+                      <span className="text-[10px] font-bold bg-slate-100 text-slate-500 px-2 py-0.5 rounded-md">{rec.date}</span>
+                      {rec.note && <span className="text-xs text-slate-500 truncate">{rec.note}</span>}
+                    </div>
+                  </div>
+                  <button 
+                    onClick={() => onDeleteRecord(rec.id)} 
+                    className="p-2.5 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all"
+                    title="刪除此紀錄"
+                  >
+                    <Trash2 size={18} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
       </div>
     </div>
   );
 }
 
-function ScoreModal({ onSave }) {
+// --- 評分 Modal ---
+function ScoreModal({ selectedCount, singleName, onClose, onSave }) {
   const [type, setType] = useState('positive'); 
   const [item, setItem] = useState('');
-  const [pts, setPts] = useState(1);
+  const [points, setPoints] = useState(1);
   const [note, setNote] = useState('');
+
   const isPos = type === 'positive';
   const list = isPos ? CATEGORIES.positive : CATEGORIES.negative;
 
   return (
-    <div className="space-y-6">
-      <div className="flex bg-slate-100 p-1 rounded-2xl">
-        <button onClick={() => { setType('positive'); setItem(''); setPts(1); }} className={`flex-1 py-3 rounded-xl font-black transition flex items-center justify-center gap-2 ${isPos ? 'bg-white text-green-600 shadow-sm' : 'text-slate-400'}`}><ThumbsUp size={18}/> 獎勵</button>
-        <button onClick={() => { setType('negative'); setItem(''); setPts(1); }} className={`flex-1 py-3 rounded-xl font-black transition flex items-center justify-center gap-2 ${!isPos ? 'bg-white text-red-600 shadow-sm' : 'text-slate-400'}`}><ThumbsDown size={18}/> 懲處</button>
-      </div>
-      <div className="grid grid-cols-3 gap-2">
-        {list.map(i => (
-          <button key={i} onClick={() => setItem(i)} className={`py-3 px-1 text-xs font-bold rounded-xl border-2 transition ${item === i ? (isPos ? 'bg-green-50 border-green-500 text-green-700' : 'bg-red-50 border-red-500 text-red-700') : 'bg-white border-slate-100 text-slate-600 hover:border-slate-300'}`}>
-            {i}
+    <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-end sm:items-center justify-center z-[100] p-0 sm:p-4">
+      <div className="bg-white w-full max-w-md rounded-t-[2.5rem] sm:rounded-[2.5rem] p-6 sm:p-8 shadow-2xl animate-in slide-in-from-bottom-full sm:slide-in-from-bottom-0 sm:zoom-in-95 max-h-[90vh] overflow-y-auto">
+        <div className="flex justify-between items-center mb-6">
+          <div>
+            <p className="text-xs font-black text-slate-400 uppercase tracking-wider mb-1">給分作業</p>
+            <h3 className="text-2xl font-black text-indigo-600">{selectedCount === 1 ? singleName : `批次處理 (${selectedCount}人)`}</h3>
+          </div>
+          <button onClick={onClose} className="p-2.5 bg-slate-100 hover:bg-slate-200 rounded-full text-slate-500 transition-colors">
+            <X size={24} />
           </button>
-        ))}
+        </div>
+
+        <div className="flex bg-slate-100 p-1.5 rounded-2xl mb-6">
+          <button onClick={() => { setType('positive'); setItem(''); setPoints(1); }} className={`flex-1 py-3.5 rounded-xl font-black transition-all flex items-center justify-center gap-2 ${isPos ? 'bg-white text-green-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}><ThumbsUp size={18}/> 獎勵</button>
+          <button onClick={() => { setType('negative'); setItem(''); setPoints(1); }} className={`flex-1 py-3.5 rounded-xl font-black transition-all flex items-center justify-center gap-2 ${!isPos ? 'bg-white text-red-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}><ThumbsDown size={18}/> 懲處</button>
+        </div>
+
+        <div className="grid grid-cols-3 gap-2 mb-6">
+          {list.map(i => (
+            <button key={i} onClick={() => setItem(i)} className={`py-3.5 px-2 text-xs font-bold rounded-xl border-2 transition-all ${item === i ? (isPos ? 'bg-green-50 border-green-500 text-green-700' : 'bg-red-50 border-red-500 text-red-700') : 'bg-white border-slate-100 text-slate-600 hover:border-slate-300'}`}>
+              {i}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex items-center justify-between bg-slate-50 p-5 rounded-2xl mb-4 border border-slate-100">
+          <span className="font-black text-slate-700">設定配分</span>
+          <div className="flex items-center gap-5">
+            <button onClick={() => setPoints(Math.max(1, points-1))} className="w-10 h-10 bg-white rounded-full shadow-sm font-black text-slate-600 border border-slate-100 active:scale-90">-</button>
+            <span className="text-3xl font-black text-indigo-600 w-8 text-center">{points}</span>
+            <button onClick={() => setPoints(points+1)} className="w-10 h-10 bg-white rounded-full shadow-sm font-black text-slate-600 border border-slate-100 active:scale-90">+</button>
+          </div>
+        </div>
+
+        <div className="mb-8">
+          <label className="block text-sm font-bold text-slate-600 mb-2 ml-2">備註事項 (選填)</label>
+          <input 
+            type="text" 
+            value={note} 
+            onChange={(e) => setNote(e.target.value)}
+            placeholder="輸入相關備註..." 
+            className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 text-sm font-medium transition-all"
+          />
+        </div>
+
+        <button 
+          onClick={() => onSave(type, item, points, note)} 
+          disabled={!item} 
+          className={`w-full py-4.5 rounded-2xl font-black text-white text-lg shadow-lg transition-all active:scale-95 flex justify-center items-center gap-2 ${!item ? 'bg-slate-300 shadow-none' : (isPos ? 'bg-green-600 shadow-green-200' : 'bg-red-600 shadow-red-200')}`}
+        >
+          <Save size={20}/> 確認儲存
+        </button>
       </div>
-      <div className="flex items-center justify-between bg-slate-50 p-4 rounded-2xl border border-slate-100">
-        <span className="font-black text-slate-700">設定配分</span>
-        <div className="flex items-center gap-4">
-          <button onClick={() => setPts(Math.max(1, pts-1))} className="w-10 h-10 bg-white rounded-full shadow-sm font-black active:scale-95 transition-transform">-</button>
-          <span className="text-2xl font-black text-indigo-600 w-8 text-center">{pts}</span>
-          <button onClick={() => setPts(pts+1)} className="w-10 h-10 bg-white rounded-full shadow-sm font-black active:scale-95 transition-transform">+</button>
+    </div>
+  );
+}
+
+// --- 匯入/新增班級 Modal ---
+function ImportClassModal({ onClose, onSave, showNotify }) {
+  const [name, setName] = useState('');
+  const [file, setFile] = useState(null);
+  const [isImporting, setIsImporting] = useState(false);
+  const fileRef = useRef(null);
+
+  const processFile = async () => {
+    if (!name.trim()) return showNotify("請先輸入班級名稱");
+    if (!file) {
+      onSave({ name }, []);
+      return;
+    }
+
+    setIsImporting(true);
+    try {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const data = new Uint8Array(e.target.result);
+          const wb = XLSX.read(data, { type: 'array' });
+          const sheet = wb.Sheets[wb.SheetNames[0]];
+          const json = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+          
+          if (!json.length) throw new Error("檔案為空");
+
+          let hIdx = -1, sIdx = -1, nIdx = -1;
+          for (let i = 0; i < Math.min(json.length, 10); i++) {
+            const row = json[i].map(c => c.toString().trim());
+            const fs = row.findIndex(h => h.includes('座號') || h.includes('號碼') || h === 'No');
+            const fn = row.findIndex(h => h.includes('姓名') || h === 'Name');
+            if (fs !== -1 && fn !== -1) { hIdx = i; sIdx = fs; nIdx = fn; break; }
+          }
+
+          if (hIdx === -1) throw new Error("找不到包含「座號」與「姓名」的標題欄");
+
+          const students = [];
+          for (let i = hIdx + 1; i < json.length; i++) {
+            const row = json[i];
+            const seatNo = row[sIdx]?.toString().trim();
+            const sname = row[nIdx]?.toString().trim();
+            if (seatNo || sname) students.push({ seatNo: seatNo || (students.length + 1), name: sname || "未命名" });
+          }
+
+          if (students.length === 0) throw new Error("沒有找到有效的學生資料");
+          
+          onSave({ name }, students);
+        } catch (err) {
+          showNotify("解析失敗: " + err.message);
+        } finally {
+          setIsImporting(false);
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    } catch (err) {
+      showNotify("讀取檔案失敗");
+      setIsImporting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-[100] p-4 sm:p-6">
+      <div className="bg-white w-full max-w-md rounded-[2.5rem] p-8 shadow-2xl animate-in zoom-in-95">
+        <div className="flex justify-between items-center mb-8">
+          <h3 className="text-2xl font-black text-slate-800">建立班級</h3>
+          <button onClick={onClose} className="p-2 bg-slate-100 rounded-full text-slate-400"><X size={20}/></button>
+        </div>
+        
+        <div className="space-y-6 mb-8">
+          <div>
+            <label className="block font-bold text-slate-700 mb-2 ml-1">班級名稱 <span className="text-red-500">*</span></label>
+            <input 
+              autoFocus
+              value={name} onChange={e=>setName(e.target.value)}
+              placeholder="例如：101班"
+              className="w-full bg-slate-50 border border-slate-200 focus:border-indigo-500 rounded-2xl p-4 outline-none font-bold transition-all"
+            />
+          </div>
+          
+          <div>
+            <label className="block font-bold text-slate-700 mb-2 ml-1">匯入學生名單 (選填)</label>
+            {!file ? (
+              <div onClick={() => fileRef.current.click()} className="border-2 border-dashed border-slate-300 hover:border-indigo-400 bg-slate-50 hover:bg-indigo-50/50 rounded-3xl p-8 text-center cursor-pointer transition-all">
+                <input type="file" ref={fileRef} onChange={e => setFile(e.target.files[0])} accept=".xlsx,.csv" className="hidden" />
+                <UploadCloud className="w-10 h-10 text-indigo-400 mx-auto mb-3" />
+                <p className="font-bold text-slate-600">點擊上傳 Excel 或 CSV</p>
+                <p className="text-xs text-slate-400 mt-2">需包含「座號」與「姓名」欄位</p>
+              </div>
+            ) : (
+              <div className="bg-indigo-50 border border-indigo-100 rounded-2xl p-4 flex items-center justify-between">
+                <div className="flex items-center gap-3 overflow-hidden">
+                  <FileSpreadsheet className="w-8 h-8 text-indigo-600 flex-shrink-0" />
+                  <span className="font-bold text-slate-700 truncate">{file.name}</span>
+                </div>
+                <button onClick={() => setFile(null)} className="p-2 bg-white rounded-full text-slate-400 hover:text-red-500 shadow-sm"><X size={16} /></button>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <button onClick={processFile} disabled={!name || isImporting} className="w-full py-4 bg-indigo-600 text-white rounded-2xl font-black text-lg shadow-lg shadow-indigo-200 disabled:opacity-50 disabled:shadow-none transition-all active:scale-95 flex justify-center items-center gap-2">
+          {isImporting ? <RefreshCw className="animate-spin w-5 h-5"/> : <CheckCircle2 className="w-5 h-5"/>} {file ? '匯入並建立' : '建立空班級'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// --- 編輯學生名單 Modal ---
+function EditStudentsModal({ classId, className, students, onClose, onSave }) {
+  const [list, setList] = useState([...students]);
+  const [newSeat, setNewSeat] = useState('');
+  const [newName, setNewName] = useState('');
+
+  const addStudent = () => {
+    if (!newSeat.trim() || !newName.trim()) return;
+    setList([...list, {
+      id: `std_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+      classId, seatNo: newSeat.trim(), name: newName.trim()
+    }]);
+    setNewSeat(''); setNewName('');
+  };
+
+  return (
+    <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-end sm:items-center justify-center z-[100] p-0 sm:p-4">
+      <div className="bg-white w-full max-w-md rounded-t-[2.5rem] sm:rounded-[2.5rem] p-6 sm:p-8 shadow-2xl animate-in slide-in-from-bottom-full sm:slide-in-from-bottom-0 sm:zoom-in-95 max-h-[90vh] flex flex-col">
+        <div className="flex justify-between items-center mb-6 flex-shrink-0">
+          <div>
+            <p className="text-xs font-black text-slate-400 uppercase tracking-wider mb-1">{className}</p>
+            <h3 className="text-2xl font-black text-slate-800">編輯學生名單</h3>
+          </div>
+          <button onClick={onClose} className="p-2.5 bg-slate-100 hover:bg-slate-200 rounded-full text-slate-500"><X size={20}/></button>
+        </div>
+
+        {/* 新增區塊 */}
+        <div className="bg-indigo-50 p-4 rounded-2xl border border-indigo-100 mb-6 flex-shrink-0">
+          <p className="text-xs font-bold text-indigo-800 mb-3 flex items-center gap-1"><UserPlus size={14}/> 加入轉入生</p>
+          <div className="flex gap-2">
+            <input type="number" value={newSeat} onChange={e=>setNewSeat(e.target.value)} placeholder="座號" className="w-16 p-3 rounded-xl border border-white focus:border-indigo-300 outline-none font-bold text-sm text-center" />
+            <input type="text" value={newName} onChange={e=>setNewName(e.target.value)} placeholder="學生姓名" className="flex-1 p-3 rounded-xl border border-white focus:border-indigo-300 outline-none font-bold text-sm" />
+            <button onClick={addStudent} disabled={!newSeat||!newName} className="px-4 bg-indigo-600 text-white rounded-xl font-bold disabled:opacity-50 active:scale-95 shadow-sm"><Plus size={20}/></button>
+          </div>
+        </div>
+
+        {/* 列表區塊 */}
+        <div className="flex-1 overflow-y-auto min-h-[200px] bg-slate-50 rounded-2xl p-2 border border-slate-100">
+          {list.sort((a,b)=> (parseInt(a.seatNo)||0)-(parseInt(b.seatNo)||0)).map(s => (
+            <div key={s.id} className="flex justify-between items-center p-3 bg-white mb-2 rounded-xl shadow-sm border border-slate-100 group">
+              <div className="flex items-center gap-3">
+                <span className="w-8 text-center text-xs font-black text-slate-400 bg-slate-50 py-1 rounded-md">{s.seatNo}</span>
+                <span className="font-bold text-slate-700">{s.name}</span>
+              </div>
+              <button onClick={() => setList(list.filter(x=>x.id!==s.id))} className="text-slate-300 hover:text-red-500 hover:bg-red-50 p-1.5 rounded-lg transition-colors">
+                <Trash2 size={16}/>
+              </button>
+            </div>
+          ))}
+          {list.length === 0 && <p className="text-center text-slate-400 font-bold mt-10">尚無學生名單</p>}
+        </div>
+
+        <div className="pt-6 flex-shrink-0">
+          <button onClick={() => onSave(list)} className="w-full py-4 bg-slate-900 text-white rounded-2xl font-black shadow-lg shadow-slate-200 flex items-center justify-center gap-2 active:scale-95 transition-transform">
+            <Save size={20} /> 儲存變更
+          </button>
         </div>
       </div>
-      <input type="text" value={note} onChange={e => setNote(e.target.value)} placeholder="備註事項 (選填)..." className="w-full p-4 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:border-indigo-500 text-sm font-medium transition-all" />
-      <button onClick={() => onSave(type, item, pts, note)} disabled={!item} className={`w-full py-4 rounded-2xl font-black text-white text-lg shadow-lg active:scale-95 flex justify-center items-center gap-2 transition-all ${!item ? 'bg-slate-300 shadow-none' : (isPos ? 'bg-green-600' : 'bg-red-600')}`}>
-        <Save size={20}/> 確認儲存
-      </button>
     </div>
   );
 }
