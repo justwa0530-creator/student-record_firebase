@@ -9,7 +9,7 @@ import {
 } from 'lucide-react';
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { 
-  getAuth, onAuthStateChanged, signInAnonymously, signInWithPopup, 
+  getAuth, onAuthStateChanged, signInWithPopup, 
   signInWithRedirect, getRedirectResult, GoogleAuthProvider, signOut,
   signInWithCustomToken 
 } from 'firebase/auth';
@@ -78,15 +78,16 @@ export default function App() {
   const [appData, setAppData] = useState({ classes: [], students: [], records: [], settings: { schoolName: "" }, lastSync: null });
   const [activeTab, setActiveTab] = useState('dashboard');
   const [selectedClassId, setSelectedClassId] = useState(null);
+  const [editClassId, setEditClassId] = useState(null); // 新增：用於編輯名單的目標班級
   const [syncStatus, setSyncStatus] = useState('idle'); // idle, syncing, success, error
   const [apiUrl, setApiUrl] = useState(''); // GAS URL
 
   // UI 互動狀態
-  const [viewMode, setViewMode] = useState('grid'); // 'grid' | 'table'
+  const [viewMode, setViewMode] = useState('grid'); // 'grid' (卡片) | 'table' (總表)
   const [isSelectionMode, setIsSelectionMode] = useState(false);
   const [selectedStudents, setSelectedStudents] = useState([]);
+  const [targetStudentId, setTargetStudentId] = useState(null); // 檢視個人檔案的目標
   const [modalOpen, setModalOpen] = useState(null); // 'score', 'importClass', 'editStudents', 'profile'
-  const [targetStudentId, setTargetStudentId] = useState(null); // 個人檔案目標學生
   const [notification, setNotification] = useState(null);
 
   // ----------------------------------------------------------------
@@ -116,7 +117,8 @@ export default function App() {
         setUser(u);
         if (!u.isAnonymous) fetchCloudData(u.uid);
       } else {
-        setUser(null);
+        // 如果是登出狀態，檢查是否為本機訪客
+        setUser(prev => prev?.uid === 'local-guest' ? prev : null);
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
           try { await signInWithCustomToken(auth, __initial_auth_token); } catch(e) {}
         }
@@ -153,8 +155,8 @@ export default function App() {
     let hasError = false;
     setSyncStatus('syncing');
 
-    // 1. Firebase Sync
-    if (user && !user.isAnonymous) {
+    // 1. Firebase Sync (僅當綁定帳號時)
+    if (user && !user.isAnonymous && user.uid !== 'local-guest') {
       try {
         const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'data', 'main');
         await setDoc(docRef, { ...dataToSave, lastSync: serverTimestamp() });
@@ -180,7 +182,7 @@ export default function App() {
 
     if (hasError) {
       setSyncStatus('error');
-    } else if ((user && !user.isAnonymous) || apiUrl) {
+    } else if ((user && !user.isAnonymous && user.uid !== 'local-guest') || apiUrl) {
       setSyncStatus('success');
       setTimeout(() => setSyncStatus('idle'), 2000);
     } else {
@@ -203,7 +205,7 @@ export default function App() {
       }
     } catch (err) {
       setSyncStatus('error');
-      showNotify('Google Sheet 下載失敗。請確定腳本已支援 GET 讀取功能。');
+      showNotify('Google Sheet 下載失敗。');
     }
   };
 
@@ -234,15 +236,17 @@ export default function App() {
     } finally { setAuthLoading(false); }
   };
 
-  const handleGuestLogin = async () => {
-    setAuthLoading(true);
-    try { await signInAnonymously(auth); } catch (e) { alert("訪客登入失敗"); }
-    finally { setAuthLoading(false); }
+  const handleGuestLogin = () => {
+    // 訪客模式：不呼叫 Firebase 驗證，直接建立本地端假帳號
+    setUser({ uid: 'local-guest', isAnonymous: true, displayName: '訪客' });
+    setAuthLoading(false);
   };
 
   const handleLogout = async () => {
     if (window.confirm("確定登出？未同步資料將遺失。")) {
-      await signOut(auth);
+      if (!user?.isAnonymous && user?.uid !== 'local-guest') {
+        await signOut(auth);
+      }
       setAppData({ classes: [], students: [], records: [], settings: { schoolName: "" }, lastSync: null });
       localStorage.removeItem('school_moral_v2');
       setUser(null);
@@ -272,11 +276,11 @@ export default function App() {
     return { ...cls, students: studentsWithPoints };
   }, [appData, selectedClassId]);
 
+  // 計算選定目標學生的個人歷史檔案
   const targetStudentProfile = useMemo(() => {
     if (!targetStudentId) return null;
     const student = appData.students.find(s => s.id === targetStudentId);
     if (!student) return null;
-    // 依時間/ID降序排序，最新紀錄在最上面
     const records = appData.records.filter(r => r.studentId === targetStudentId).sort((a, b) => b.id.localeCompare(a.id));
     return { ...student, records };
   }, [appData, targetStudentId]);
@@ -320,9 +324,9 @@ export default function App() {
     showNotify(targetIds.length > 1 ? `已批次新增 ${targetIds.length} 筆紀錄` : `已新增紀錄`);
   };
 
-  // 刪除單筆紀錄
+  // 刪除單筆歷史紀錄
   const handleDeleteRecord = (recordId) => {
-    if (window.confirm("確定刪除這筆紀錄？分數將會自動扣回。")) {
+    if (window.confirm("確定刪除這筆紀錄？分數將會自動從總分扣除/補回。")) {
       const newRecords = appData.records.filter(r => r.id !== recordId);
       saveState({ ...appData, records: newRecords });
       showNotify("紀錄已刪除，分數已自動更新！");
@@ -503,7 +507,7 @@ export default function App() {
       <header className="sticky top-0 bg-white/90 backdrop-blur-md border-b border-slate-200 px-6 py-4 flex justify-between items-center z-40">
         <div>
           <h2 className="text-xl font-black text-slate-800">
-            {activeTab === 'dashboard' ? '計分管理' : activeTab === 'classes' ? '班級設定' : '系統設定'}
+            {activeTab === 'dashboard' ? '計分管理' : activeTab === 'classes' ? '班級管理' : '系統設定'}
           </h2>
           <div className="flex items-center gap-1.5 mt-0.5">
             <div className={`w-1.5 h-1.5 rounded-full ${syncStatus === 'success' ? 'bg-green-500' : syncStatus === 'syncing' ? 'bg-indigo-500 animate-pulse' : 'bg-slate-300'}`}></div>
@@ -537,49 +541,64 @@ export default function App() {
                 onClick={() => setActiveTab('classes')}
                 className="px-5 py-3 rounded-2xl font-bold text-sm whitespace-nowrap bg-indigo-50 text-indigo-600 flex items-center gap-2 border border-indigo-100 hover:bg-indigo-100 transition-colors"
               >
-                <Settings size={16} /> 管理班級
+                <Settings size={16} /> 課程管理
               </button>
             </div>
 
             {/* 動作列 (僅當有選擇班級時顯示) */}
             {activeClassData && (
-              <div className="bg-white p-3 rounded-2xl shadow-sm border border-slate-200 flex flex-wrap gap-2 justify-between items-center">
-                <div className="flex items-center gap-2">
-                  {/* 視圖切換 (網格 / 表格) */}
-                  <div className="hidden sm:flex items-center bg-slate-100 p-1.5 rounded-xl border border-slate-200 mr-2">
-                    <button onClick={() => setViewMode('grid')} className={`p-1.5 rounded-lg transition-all ${viewMode==='grid'?'bg-white shadow-sm text-indigo-600':'text-slate-400 hover:text-slate-600'}`} title="卡片檢視"><LayoutGrid size={18}/></button>
-                    <button onClick={() => setViewMode('table')} className={`p-1.5 rounded-lg transition-all ${viewMode==='table'?'bg-white shadow-sm text-indigo-600':'text-slate-400 hover:text-slate-600'}`} title="條列檢視"><List size={18}/></button>
-                  </div>
-                  <button onClick={() => setModalOpen('editStudents')} className="p-2.5 bg-blue-50 text-blue-600 rounded-xl hover:bg-blue-100 transition-colors font-bold text-sm flex items-center gap-2">
-                    <UserCog size={18} /> <span className="hidden sm:inline">編輯名單</span>
+              <div className="bg-white p-3 rounded-2xl shadow-sm border border-slate-200 flex flex-col sm:flex-row gap-3 justify-between items-center">
+                
+                {/* 視圖切換區：分立的卡片與總表按鈕 */}
+                <div className="flex bg-slate-50 p-1.5 rounded-xl w-full sm:w-auto border border-slate-100">
+                  <button 
+                    onClick={() => { setViewMode('grid'); setIsSelectionMode(false); }} 
+                    className={`flex-1 sm:flex-none px-5 py-2.5 rounded-lg font-black text-sm transition-all flex items-center justify-center gap-2 ${viewMode==='grid'?'bg-white shadow-sm text-indigo-600':'text-slate-400 hover:text-slate-600'}`}
+                  >
+                    <LayoutGrid size={18}/> 卡片計分
                   </button>
-                  <button onClick={exportCSV} className="p-2.5 bg-green-50 text-green-600 rounded-xl hover:bg-green-100 transition-colors font-bold text-sm flex items-center gap-2">
-                    <FileDown size={18} /> <span className="hidden sm:inline">匯出總表</span>
+                  <button 
+                    onClick={() => { setViewMode('table'); setIsSelectionMode(false); }} 
+                    className={`flex-1 sm:flex-none px-5 py-2.5 rounded-lg font-black text-sm transition-all flex items-center justify-center gap-2 ${viewMode==='table'?'bg-white shadow-sm text-indigo-600':'text-slate-400 hover:text-slate-600'}`}
+                  >
+                    <List size={18}/> 檢視總表
                   </button>
                 </div>
-                <button 
-                  onClick={() => { setIsSelectionMode(!isSelectionMode); setSelectedStudents([]); }}
-                  className={`px-4 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center gap-2 ${
-                    isSelectionMode ? 'bg-indigo-600 text-white shadow-md' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                  }`}
-                >
-                  <CheckSquare size={18} /> {isSelectionMode ? '取消多選' : '多選模式'}
-                </button>
+
+                <div className="flex gap-2 w-full sm:w-auto">
+                  {/* 多選按鈕僅在卡片模式呈現 */}
+                  {viewMode === 'grid' && (
+                    <button 
+                      onClick={() => { setIsSelectionMode(!isSelectionMode); setSelectedStudents([]); }}
+                      className={`flex-1 sm:flex-none px-4 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center justify-center gap-2 ${
+                        isSelectionMode ? 'bg-indigo-600 text-white shadow-md' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                      }`}
+                    >
+                      <CheckSquare size={18} /> {isSelectionMode ? '取消多選' : '多選模式'}
+                    </button>
+                  )}
+                  
+                  <button onClick={exportCSV} className="flex-1 sm:flex-none p-2.5 px-4 bg-green-50 text-green-600 rounded-xl hover:bg-green-100 transition-colors font-bold text-sm flex items-center justify-center gap-2">
+                    <FileDown size={18} /> 匯出 CSV
+                  </button>
+                </div>
               </div>
             )}
 
-            {/* 學生呈現區域 (依據 viewMode 切換) */}
+            {/* 內容呈現區 */}
             {activeClassData ? (
               viewMode === 'table' ? (
-                /* --- 條列視圖 (Table View) --- */
-                <div className="bg-white rounded-[2rem] border border-slate-200 shadow-sm overflow-hidden mb-6">
+                /* --- 條列視圖 (檢視總表與個人紀錄) --- */
+                <div className="bg-white rounded-[2rem] border border-slate-200 shadow-sm overflow-hidden mb-6 animate-in fade-in zoom-in-95">
+                  <div className="p-4 bg-indigo-50 border-b border-indigo-100">
+                    <p className="text-sm font-bold text-indigo-800 flex items-center gap-2"><FileText size={16}/> 點選下列學生即可查看他的歷史紀錄與修改錯誤評分</p>
+                  </div>
                   <div className="overflow-x-auto">
                     <table className="w-full text-left border-collapse">
                       <thead>
                         <tr className="bg-slate-50 border-b border-slate-100 text-slate-500 text-sm">
-                          {isSelectionMode && <th className="px-6 py-4 w-16 text-center">選取</th>}
                           <th className="px-6 py-4 font-bold whitespace-nowrap">座號</th>
-                          <th className="px-6 py-4 font-bold whitespace-nowrap">姓名 <span className="text-xs text-slate-400 font-normal">(點擊看明細)</span></th>
+                          <th className="px-6 py-4 font-bold whitespace-nowrap">學生姓名</th>
                           <th className="px-6 py-4 font-bold text-green-600 whitespace-nowrap">優點</th>
                           <th className="px-6 py-4 font-bold text-red-500 whitespace-nowrap">缺點</th>
                           <th className="px-6 py-4 font-bold text-indigo-600 whitespace-nowrap">總分</th>
@@ -590,25 +609,14 @@ export default function App() {
                           <tr 
                             key={st.id}
                             onClick={() => {
-                              if (isSelectionMode) {
-                                toggleStudentSelection(st.id);
-                              } else {
-                                setTargetStudentId(st.id);
-                                setModalOpen('profile');
-                              }
+                              setTargetStudentId(st.id);
+                              setModalOpen('profile');
                             }}
-                            className={`hover:bg-slate-50 transition-colors cursor-pointer ${selectedStudents.includes(st.id) ? 'bg-indigo-50/60' : ''}`}
+                            className="hover:bg-indigo-50/50 transition-colors cursor-pointer group"
                           >
-                            {isSelectionMode && (
-                              <td className="px-6 py-4 text-center">
-                                <div className={`w-5 h-5 rounded-md mx-auto flex items-center justify-center border-2 transition-colors ${selectedStudents.includes(st.id) ? 'bg-indigo-600 border-indigo-600 text-white' : 'border-slate-300'}`}>
-                                  {selectedStudents.includes(st.id) && <Check size={14} strokeWidth={3}/>}
-                                </div>
-                              </td>
-                            )}
                             <td className="px-6 py-4 font-bold text-slate-400">{st.seatNo || '-'}</td>
                             <td className="px-6 py-4 font-black text-indigo-600 text-lg flex items-center gap-2">
-                              {st.name} <FileText size={14} className="text-slate-300 hover:text-indigo-400 transition-colors" />
+                              {st.name} <ChevronRight size={16} className="text-slate-300 group-hover:text-indigo-400 transition-colors" />
                             </td>
                             <td className="px-6 py-4 font-bold text-green-600">+{st.positivePoints}</td>
                             <td className="px-6 py-4 font-bold text-red-500">-{Math.abs(st.negativePoints)}</td>
@@ -620,7 +628,7 @@ export default function App() {
                   </div>
                 </div>
               ) : (
-                /* --- 網格視圖 (Grid View) --- */
+                /* --- 網格視圖 (卡片計分模式) --- */
                 <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5 gap-3 lg:gap-4">
                   {activeClassData.students.map(st => (
                     <button
@@ -635,7 +643,7 @@ export default function App() {
                       }}
                       className={`relative p-4 rounded-[2rem] border-2 transition-all text-left flex flex-col justify-between aspect-square ${
                         selectedStudents.includes(st.id) 
-                          ? 'border-indigo-600 bg-indigo-50 shadow-inner' 
+                          ? 'border-indigo-600 bg-indigo-50 shadow-inner scale-[0.98]' 
                           : 'border-slate-100 bg-white shadow-sm hover:shadow-md hover:border-indigo-200'
                       }`}
                     >
@@ -652,19 +660,16 @@ export default function App() {
                         )}
                       </div>
                       
-                      {/* 強調姓名，取消大字體總分 */}
-                      <div className="flex-1 flex items-center justify-center py-4">
+                      <div className="flex-1 flex items-center justify-center py-2">
                          <span className="font-black text-slate-800 text-3xl truncate w-full text-center tracking-wide">{st.name}</span>
                       </div>
                       
-                      <div className="flex gap-1.5 w-full">
-                        <div className="flex flex-col items-center flex-1 rounded-xl py-1 bg-green-50/50">
-                          <span className="text-[9px] font-bold text-green-600">優</span>
-                          <span className="text-sm font-black text-green-700">{st.positivePoints}</span>
+                      <div className="flex gap-1.5 w-full mt-2">
+                        <div className="flex flex-col items-center flex-1 rounded-xl py-1.5 bg-green-50/70 border border-green-100">
+                          <span className="text-[10px] font-bold text-green-700">優 {st.positivePoints}</span>
                         </div>
-                        <div className="flex flex-col items-center flex-1 rounded-xl py-1 bg-red-50/50">
-                          <span className="text-[9px] font-bold text-red-500">缺</span>
-                          <span className="text-sm font-black text-red-600">{Math.abs(st.negativePoints)}</span>
+                        <div className="flex flex-col items-center flex-1 rounded-xl py-1.5 bg-red-50/70 border border-red-100">
+                          <span className="text-[10px] font-bold text-red-700">缺 {Math.abs(st.negativePoints)}</span>
                         </div>
                       </div>
                     </button>
@@ -719,7 +724,15 @@ export default function App() {
                           </p>
                         </div>
                       </div>
-                      <div className="flex items-center gap-2 self-end sm:self-auto">
+                      
+                      {/* 操作區 */}
+                      <div className="flex flex-wrap items-center gap-2 self-end sm:self-auto justify-end mt-2 sm:mt-0 w-full sm:w-auto">
+                        <button 
+                          onClick={() => { setEditClassId(cls.id); setModalOpen('editStudents'); }} 
+                          className="px-4 py-2.5 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-xl font-bold text-sm transition-colors flex items-center gap-1"
+                        >
+                          <UserCog size={16} /> 編輯名單
+                        </button>
                         <button 
                           onClick={() => { setSelectedClassId(cls.id); setActiveTab('dashboard'); }}
                           className="px-5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold text-sm transition-colors"
@@ -746,26 +759,22 @@ export default function App() {
         {activeTab === 'settings' && (
           <div className="max-w-2xl mx-auto space-y-6">
             
-            {/* 帳號區塊：強調自動同步 */}
+            {/* 帳號區塊 */}
             <div className="bg-white rounded-[2.5rem] p-8 shadow-sm border border-slate-100">
-              <h3 className="text-xl font-black mb-2 flex items-center gap-2 text-slate-800">
-                <Cloud className="text-indigo-600" /> 帳號管理與雲端備份
+              <h3 className="text-xl font-black mb-6 flex items-center gap-2 text-slate-800">
+                <Cloud className="text-indigo-600" /> 帳號與 Firebase 同步
               </h3>
-              <p className="text-sm text-slate-500 mb-6 font-medium leading-relaxed">
-                只要登入 Google 帳號，您的所有資料與評分紀錄都會<strong className="text-indigo-600">自動且即時地同步至 Firebase 雲端資料庫</strong>，確保資料安全不遺失。
-              </p>
-
               <div className="flex items-center justify-between p-6 bg-slate-50 rounded-3xl mb-6 border border-slate-100">
                 <div className="flex items-center gap-4">
                   <div className="w-16 h-16 bg-white rounded-2xl flex items-center justify-center border border-slate-200 shadow-sm overflow-hidden flex-shrink-0">
-                    {user.photoURL && !user.isAnonymous ? <img src={user.photoURL} alt="avatar" /> : <User size={32} className="text-slate-300" />}
+                    {user.photoURL && !user.isAnonymous && user.uid !== 'local-guest' ? <img src={user.photoURL} alt="avatar" /> : <User size={32} className="text-slate-300" />}
                   </div>
                   <div className="overflow-hidden">
                     <div className="flex items-center gap-2 mb-1">
                       <span className="font-black text-xl text-slate-800 truncate">{getUserDisplayName(user)}</span>
                     </div>
                     <p className="text-slate-500 text-sm font-medium truncate">
-                      {user.isAnonymous ? '目前為訪客模式 (資料僅存本機)' : user.email}
+                      {user.isAnonymous ? '資料僅存本機，清除瀏覽器即遺失' : user.email}
                     </p>
                   </div>
                 </div>
@@ -783,27 +792,27 @@ export default function App() {
               ) : (
                 <div className="flex gap-3">
                   <button onClick={() => saveState(appData)} className="flex-1 py-4 bg-indigo-600 text-white rounded-2xl font-bold shadow-lg shadow-indigo-100 active:scale-95 transition flex justify-center items-center gap-2">
-                    <RefreshCw size={20}/> 手動強制同步
+                    <RefreshCw size={20}/> 強制同步
                   </button>
                   <button onClick={handleLogout} className="flex-1 py-4 bg-red-50 text-red-600 border border-red-100 rounded-2xl font-bold active:scale-95 transition flex justify-center items-center gap-2">
-                    <LogOut size={20}/> 登出系統
+                    <LogOut size={20}/> 登出
                   </button>
                 </div>
               )}
             </div>
 
-            {/* GAS 備份區塊：備用第二方案 */}
+            {/* GAS 備份區塊 */}
             <div className="bg-white rounded-[2.5rem] p-8 shadow-sm border border-slate-100">
               <h3 className="text-xl font-black mb-2 flex items-center gap-2 text-slate-800">
-                <Database className="text-green-600" /> GAS 備用同步方案
+                <Database className="text-green-600" /> Google Sheets (GAS) 備份
               </h3>
               <p className="text-sm text-slate-500 font-medium mb-6 leading-relaxed">
-                這是<strong className="text-amber-600">備案第二方案（非必填）</strong>。若您希望額外將資料寫入 Google Sheets 試算表以方便瀏覽或留存，才需要進行下方設定：
+                將資料同時寫入您指定的 Google 試算表。可作為第二重備份保障。
               </p>
               
               <div className="space-y-4">
                 <div>
-                  <label className="block text-xs font-bold text-slate-400 uppercase tracking-wider mb-2 ml-2">Google App Script (GAS) 網址</label>
+                  <label className="block text-xs font-bold text-slate-400 uppercase tracking-wider mb-2 ml-2">API 網址 (Web App URL)</label>
                   <input 
                     type="text" 
                     value={apiUrl} 
@@ -818,7 +827,7 @@ export default function App() {
                     disabled={!apiUrl}
                     className="flex-1 py-3.5 bg-green-50 text-green-700 rounded-xl font-bold active:scale-95 transition-all disabled:opacity-50 disabled:bg-slate-50 disabled:text-slate-400"
                   >
-                    備份至試算表
+                    上傳至試算表
                   </button>
                   <button 
                     onClick={fetchFromGasCloud} 
@@ -836,7 +845,7 @@ export default function App() {
       </main>
 
       {/* 浮動多選動作條 */}
-      {isSelectionMode && selectedStudents.length > 0 && (
+      {isSelectionMode && selectedStudents.length > 0 && viewMode === 'grid' && (
         <div className="fixed bottom-24 lg:bottom-10 left-1/2 -translate-x-1/2 bg-slate-900 text-white px-6 py-4 rounded-full flex items-center gap-6 shadow-2xl z-50 animate-in slide-in-from-bottom-10">
           <span className="text-sm font-black whitespace-nowrap">已選 {selectedStudents.length} 人</span>
           <div className="flex gap-2">
@@ -877,18 +886,18 @@ export default function App() {
         />
       )}
 
-      {/* 3. 編輯學生名單 Modal */}
-      {modalOpen === 'editStudents' && activeClassData && (
+      {/* 3. 編輯學生名單 Modal (由課程管理觸發) */}
+      {modalOpen === 'editStudents' && editClassId && (
         <EditStudentsModal
-          className={activeClassData.name}
-          classId={activeClassData.id}
-          students={activeClassData.students}
-          onClose={() => setModalOpen(null)}
-          onSave={(newStudents) => { handleUpdateStudents(activeClassData.id, newStudents); setModalOpen(null); }}
+          className={appData.classes.find(c => c.id === editClassId)?.name}
+          classId={editClassId}
+          students={appData.students.filter(s => s.classId === editClassId)}
+          onClose={() => { setModalOpen(null); setEditClassId(null); }}
+          onSave={(newStudents) => { handleUpdateStudents(editClassId, newStudents); setModalOpen(null); setEditClassId(null); }}
         />
       )}
 
-      {/* 4. 新增：個人紀錄檔案 Modal */}
+      {/* 4. 個人歷史紀錄 Modal (由檢視總表點擊觸發) */}
       {modalOpen === 'profile' && targetStudentProfile && (
         <ProfileModal 
           student={targetStudentProfile}
@@ -906,9 +915,8 @@ export default function App() {
 // 獨立 Modal 元件
 // ==========================================
 
-// --- 個人檔案 Modal (新增功能) ---
+// --- 個人檔案 Modal ---
 function ProfileModal({ student, records, onClose, onDeleteRecord }) {
-  // 統計分數
   const posPoints = records.filter(r => r.points > 0).reduce((sum, r) => sum + r.points, 0);
   const negPoints = records.filter(r => r.points < 0).reduce((sum, r) => sum + r.points, 0);
   const total = posPoints + negPoints;
